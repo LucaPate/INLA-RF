@@ -1,0 +1,1173 @@
+---
+title: "SPDE-RF (spatial only)"
+author:
+  - name: Michela Cameletti
+    url: https://orcid.org/0000-0002-6502-7779
+    affiliation: Università degli Studi di Bergamo
+    affiliation-url: https://www.unibg.it/
+  - name: Mario Figueira
+    url: https://orcid.org/0009-0004-4627-0572
+    affiliation: Universitat de València
+    affiliation-url: https://www.uv.es/
+  - name: Luca Patelli
+    url: https://orcid.org/0000-0001-5536-1047
+    affiliation: Universitat de Pavia
+    affiliation-url: http://www.unipv.eu/
+date: "`r Sys.Date()`"
+format:
+  html: 
+    theme:
+      light: flatly
+      dark: darkly
+    toc: true
+    embed-resources: true
+    page-layout: full
+    grid:
+      sidebar-width: 300px
+      body-width: 1200px
+      margin-width: 300px
+      gutter-width: 1.5rem
+---
+
+<!-- Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>. -->
+
+## Introduction
+
+This example presents the analysis using a combination of Bayesian inference (INLA) and Random Forest (RF). It shows the result of the first loop of the algorithm for this combined data analysis. To this end, various scenarios with spatial dependence and different structures of non-linearity in the covariates are simulated.
+
+These two scenarios are defined by non-linear effects:
+
+- strong non-linearity scenario,
+- weak non-linearity scenario.
+  
+In both scenarios, there will be a categorical variable with three levels (A, B, C), a spatial effect, and two covariates. In the strong non-linearity scenario, both covariates will exhibit a non-linear structure, whereas in the second scenario, only one of the covariates will have a non-linear relationship.
+
+## Data simulation 
+
+The model for data simulation is defined as following:
+
+$$\mathbf{y} = \mathbf{X}\boldsymbol\beta + \sum_{k\in K} \mathbf{f}_k(\mathbf{z}_k) + \mathbf{u}_s + \boldsymbol\varepsilon$$
+where $\mathbf{X}\boldsymbol\beta$ are the covariates with their linear effects: the categorical variable and the covariate with linear effect in the weak non-linearity scenario. The non-linear effects of the covariates are captured by $\sum_{k\in K} \mathbf{f}_k(\mathbf{z}_k)$, such that $K=1$ stands for the weak non-linearity scenario, and $K=2$ represents the strong non-linearity scenario. Finally, $\mathbf{u}_s$ is the spatial effect and $\boldsymbol\varepsilon$ is the Gaussian noise of the observations. Using this structure, $1000$ data will be simulated at random locations within the study region.
+
+For data simulation, we will first define and simulate the components of the model in the following order
+
+- defining the study region and the mesh for simulating the spatial effect (SPDE-FEM),
+- simulating the spatial effect and the categorical variable (common to both scenarios), and
+- simulating the non-linear effects for each scenario.
+
+These components constitute the linear predictor of the model.
+
+
+```{r Libraries_1, echo=FALSE, warning=FALSE, message=FALSE}
+library(Matrix)
+library(parallel)
+
+library(INLA)
+library(inlabru)
+library(fmesher)
+
+library(ggplot2)
+library(gridExtra)
+library(ggtext)
+library(dplyr)
+library(sf)
+
+library(ranger)
+
+library(kableExtra)
+```
+
+```{r Custom_functions_1, echo=FALSE, warning=FALSE, message=FALSE}
+## Function to fix the precision matrix from inla.call.object$misc$configs$config[[k]]$Q (or Qprior or Qinv)
+fix.Q <- function(Q) {
+  # Q: the precision matrix from the inla.call.object; inla.call.object <- inla(...) 
+  d <- diag(Q)
+  Q <- Q + t(Q)
+  diag(Q) <- d
+  return (Q)
+}
+
+## Function to simulate a SPDE effect in R2
+simulation_SPDE <- function(mesh, sigma = 1, range = 1, constr=TRUE, seed){
+  # mesh: 
+  # sigma: the marginal precision of the CAR prior (the variability between first-order neighbors)
+  # range: the spatial range; it means the range at which the correlation falls to 0.1 (in the correl)
+  # constr: an argument that, if TRUE, forces the GMRF to have a global mean of zero
+  # seed: seed to reproduce the result
+  if(!missing(seed)){set.seed(seed)}
+  Q = fmesher::fm_matern_precision(x = mesh, alpha = 2, rho = range, sigma = sigma)
+  L = Matrix::chol(Q)
+  w = rnorm(nrow(Q))
+  u_sp = backsolve(L, w)
+  if(constr){
+    u_sp = u_sp - mean(u_sp)
+  }
+  return(list(u=u_sp, Q=Q))
+}
+```
+
+```{r Set_seed, echo=FALSE, warning=FALSE, message=FALSE}
+## set the seed for reproducibility
+seed <- 1234
+set.seed(seed = seed)
+```
+
+### Defining the study region and the mesh for the spatial simulation
+
+```{r Defining_study_region, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap: 
+#|   - "A. Original boundary and the internal boundary to define the mesh for the SPDE-FEM approach."
+#|   - "B. Mesh for the simulation of the spatial effect using the SPDE-FEM approach."
+
+## Defining the study region ----
+data(PRborder)
+sf_PRborder <- st_sfc(st_polygon(x = list(PRborder))) # boundary of the sr (study region)
+PR_nchull <- fm_nonconvex_hull_inla(x =  sf_PRborder, convex = -0.05)
+st_PR_int_nchull <-  st_polygon(x = list(PR_nchull$loc[c(PR_nchull$idx[1:which(PR_nchull$idx[1,1]==PR_nchull$idx[,2]),1],1),1:2]))
+
+# Plot of the simplified boundary and the original one 
+gg_PR_int <- ggplot() + 
+  geom_sf(st_PR_int_nchull, mapping = aes(color = "Internal")) + 
+  geom_sf(sf_PRborder, mapping = aes(color = "Original")) + 
+  theme_bw() + labs(title = "Original and internal boundary", color = "Boundaries") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+## Mesh creation and 
+mesh_sim <- fm_mesh_2d_inla(boundary = list(st_PR_int_nchull), max.edge = c(0.2,0.5), offset = c(-0.01,-0.1))
+
+gg_mesh <- ggplot() + 
+  gg(mesh_sim) + labs(title = "Mesh for the SPDE-FEM simulation") +
+  coord_sf() + theme_bw() + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), axis.title.x = element_blank(), axis.title.y = element_blank())
+
+# grid.arrange(arrangeGrob(grobs = list(gg_PR_int, gg_mesh), ncol = 2))
+gg_PR_int; gg_mesh
+```
+
+### Simulating the spatial effect (SPDE2) and the categorical variable
+
+```{r Simulation_sp_cat, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 3
+#| fig-cap:
+#|   - "A. Spatial effect along the study region."
+#|   - "B. Spatial effect values in the sample locations."
+#|   - "C. Levels of the categorial variable in the sample locations."
+
+## Spatial effect simulation
+sp_sim <- simulation_SPDE(mesh = mesh_sim, sigma = 1, range = 0.3, constr = TRUE, seed = seed)
+
+st_bbox_sr <- st_bbox(obj = st_PR_int_nchull)
+loc_grid <- expand.grid(x = seq(from = st_bbox_sr[1], to = st_bbox_sr[3], length.out = 1E2), y = seq(from = st_bbox_sr[2], to = st_bbox_sr[4], length.out = 1E2))
+st_loc_grid_t <- st_multipoint(x = as.matrix(loc_grid)) %>% st_geometry(.) %>% st_cast("POINT")
+idx <- st_intersects(x = st_loc_grid_t, st_PR_int_nchull, sparse = FALSE)
+
+sample_size <- 1E3
+st_loc_grid <- st_loc_grid_t[idx,] # Grid points that are inside the study region
+st_sample_points <- st_sample(x = st_PR_int_nchull, size = sample_size) # Sample points
+
+df_sp <- st_sf(data.frame(sp = drop(fm_basis(x = mesh_sim, loc = st_coordinates(st_loc_grid)[,1:2]) %*% sp_sim$u)), geometry = st_loc_grid)
+df_sp_sample <- st_sf(data.frame(sp = drop(fm_basis(x = mesh_sim, loc = st_coordinates(st_sample_points)[,1:2]) %*% sp_sim$u)), geometry = st_sample_points)
+
+## Plot of the spatial effect (grid)
+ggsp_grid <- ggplot() + 
+  geom_sf(data = df_sp, mapping = aes(color = sp), pch = 15) + 
+  scale_color_viridis_c(option = "turbo") + 
+  coord_sf() + theme_bw() + labs(color = "Values", title = "Spatial effect (SPDE)") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+## Plot of the spatial effect (sample locations)
+ggsp_sample <- ggplot() + 
+  geom_sf(data = df_sp_sample, mapping = aes(color = sp)) + 
+  scale_color_viridis_c(option = "turbo") + 
+  coord_sf() + theme_bw() + labs(color = "Values", title = "Spatial effect (SPDE)") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+## Simulation of the covariates ----
+
+X1 <- factor(sample(LETTERS[1:3], sample_size, replace = TRUE))
+# table(X1) # distribution of the different levels of the categorical variable
+
+# Coefficients for the qualitative regressor (categorical variables) with a sum zero constraint
+beta_cat <- cbind(rnorm(n = 3, mean = 0, sd = 2)) %>% apply(X = ., MARGIN = 2, FUN = function(x){x - mean(x)})
+
+ggcat <- ggplot() + 
+  geom_sf(data = st_sf(data.frame(X1 = unclass(X1)), geometry = st_sample_points), mapping = aes(color = as.factor(X1))) + 
+  coord_sf() + theme_bw() + labs(color = "Categories", title = "Categories in the sample locations") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# grid.arrange(arrangeGrob(grobs = list(ggsp_grid, ggsp_sample, ggcat), ncol = 3))
+ggsp_grid; ggsp_sample; ggcat
+```
+
+### Simulation of the response variable under the strong non-linearity case
+
+```{r Simulation_strong_cov_response, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 3
+#| fig-cap:
+#|   - "A. Second variable (X2) under the strong non-linearity."
+#|   - "B. Third variable (X3) under the strong non-linearity."
+#|   - "C. Response variable under strong non-linearity in the sample locations."
+
+## Simulation of the response variable under the strong non-linearity case ----
+
+X2 <- rnorm(sample_size)
+fX2 <- sin(2*X2)*(2*X2) 
+ggcov2_strong <- ggplot(data.frame(X2, fX2)) + 
+  geom_line(mapping = aes(x = X2, y = fX2)) + 
+  labs(title = "Variable X2") +
+  theme_bw() + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+X3 <- runif(sample_size)
+fX3 <- sin(X3^4) + cos(2.5*pi*X3)  
+ggcov3_strong <- ggplot(data.frame(X3, fX3)) + 
+  geom_line(mapping = aes(x = X3, y = fX3)) + 
+  labs(title = "Variable X3") +
+  theme_bw() + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+sigma_gauss <- (50)**(-1/2) # Defining the stdev. through the precision
+y <- rnorm(n = sample_size, mean = df_sp_sample$sp + beta_cat[unclass(X1)] + fX2 + fX3, sd = sigma_gauss) # Simulation of the response variable
+dfsf_sample_strong <- st_sf(data.frame(y = y, sp = df_sp_sample$sp,  
+                                       X1 = X1, fX1 = beta_cat[unclass(X1)], 
+                                       X2 = X2, fX2 = fX2, X3 = X3, fX3, fX3), 
+                            geometry = st_geometry(df_sp_sample)) # Data frame for the simulation with strong non-linearity  
+
+gg_y_strong <- ggplot() + # Response variable under weak linearity in the sample locations
+  geom_sf(data = dfsf_sample_strong, mapping = aes(color = y)) + 
+  scale_color_viridis_c(option = "turbo") +
+  coord_sf() + theme_bw() + labs(color = "Values", title = "Response variable in the sample locations") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+ggcov2_strong; ggcov3_strong; gg_y_strong
+```
+
+### Simulation of the response variable under the weak non-linearity case
+
+```{r Simulation_weak_cov_response, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 3
+#| fig-cap:
+#|   - "A. Second variable (X2) under the weak non-linearity."
+#|   - "B. Third variable (X3) under the weak non-linearity."
+#|   - "C. Response variable under weak non-linearity in the sample locations."
+
+## Simulation of the response variable under the weak non-linearity case ----
+
+X2 <- rnorm(sample_size)
+fX2 <- sin(X2)
+ggcov2_weak <- ggplot(data.frame(X2, fX2)) + 
+  geom_line(mapping = aes(x = X2, y = fX2)) + 
+  labs(title = "Variable X2") + 
+  theme_bw() + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+X3 <- runif(sample_size)
+fX3 <- X3
+ggcov3_weak <- ggplot(data.frame(X3, fX3)) + 
+  geom_line(mapping = aes(x = X3, y = fX3)) + 
+  labs(title = "Variable X3") +
+  theme_bw() + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+sigma_gauss <- (50)**(-1/2) # Defining the stdev. through the precision
+y <- rnorm(n = sample_size, mean = df_sp_sample$sp + beta_cat[unclass(X1)] + fX2 + fX3, sd = sigma_gauss) # Simulation of the response variable
+dfsf_sample_weak <- st_sf(data.frame(y = y, sp = df_sp_sample$sp, 
+                                     X1 = X1, fX1 = beta_cat[unclass(X1)], 
+                                     X2 = X2, fX2 = fX2, X3 = X3, fX3, fX3), 
+                          geometry = st_geometry(df_sp_sample)) # Data frame for the simulation with strong non-linearity 
+
+gg_y_weak <- ggplot() + # Response variable under weak linearity in the sample locations
+  geom_sf(data = dfsf_sample_weak, mapping = aes(color = y)) + 
+  scale_color_viridis_c(option = "turbo") +
+  coord_sf() + theme_bw() + labs(color = "Values", title = "Response variable in the sample locations") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+ggcov2_weak; ggcov3_weak; gg_y_weak
+```
+
+## Analysis of the data under the strong non-linearity case
+
+The analysis of the simulated data will be conducted according to the two scenarios. In each scenario, the following procedure will be followed:
+
+0. Split of the data into two train/test sets (the test set is the $20\%$ of the observations).
+1. Perform Bayesian inferential analysis, considering two models: simple and complex.
+    i) The simple model assumes that the effects of the covariates are linear.
+    ii) The complex model considers a non-linear structure for the effects of the non-linear covariates.
+2. Compute the residuals using the mean of the posterior marginal distribution of the expectation for each data point in the training and test sets. 
+3. Analyze the point estimates of the residuals using Random Forest (RF). Two different strategies will be followed:
+    i) using the values of the covariates and the Cartesian coordinates of the observation locations, or
+    ii) using the mean values of the marginal posterior distributions of the non-linear effects and the spatial effect (to capture the geometry of the marginal posterior distributions).
+4. Compare the RMSE for the train and test sets based on the results from Bayesian inference (INLA) or from combining Bayesian inference with residual analysis using RF (INLA-RF).
+
+Additionally, it would be possible to use the entire marginal posterior distribution of the expectation for the residuals, instead of the mean of this distribution, as a proxy for the residuals.
+
+### Simple INLA model and RF combined analysis (first loop only)
+
+```{r Inference_strong_cov_INLA_setup, echo=FALSE, warning=FALSE, message=FALSE}
+## Creating the train/test groups ----
+idx.test <- sample(x = 1:nrow(dfsf_sample_strong), size = round(nrow(dfsf_sample_strong)*0.2)) 
+simdata_train = dfsf_sample_strong[-idx.test,]
+simdata_test = dfsf_sample_strong[idx.test,]
+
+## INLA settings ----
+
+coord_strong_df <- st_coordinates(dfsf_sample_strong)
+coord_strong_train_df <- st_coordinates(simdata_train)
+coord_strong_test_df <- st_coordinates(simdata_test)
+
+idx_chull <- chull(x = coord_strong_df)
+st_chull <- st_polygon(x = list(coord_strong_df[c(idx_chull, idx_chull[1]),]))
+
+mesh_inf <- fm_mesh_2d_inla(boundary = list(st_chull), max.edge = c(0.15, 0.5), offset = c(0.01, -0.1))
+
+rho_0 <- st_coordinates(st_chull)[,1:2] %>% dist(.) %>% max(.)/5
+spde_inf <- inla.spde2.pcmatern(mesh = mesh_inf, alpha = 2, prior.range = c(rho_0, 0.5), prior.sigma = c(1, 0.5), constr = TRUE)
+A_sp <- fm_basis(x = mesh_inf, loc = coord_strong_train_df)
+```
+
+```{r Inference_INLA_strong_cov_INLA1, echo=FALSE, warning=FALSE, message=FALSE}
+inf_stk_1 <- inla.stack(data = list(y = simdata_train$y),
+                        A = list(A_sp, 1), 
+                        effects = list(
+                          list(sp = 1:mesh_inf$n),
+                          list(
+                            beta_0 = rep(1, nrow(simdata_train)),
+                            idx_cat = as.numeric(simdata_train$X1),
+                            beta_2 = simdata_train$X2,
+                            beta_3 = simdata_train$X3
+                          )
+                        ),
+                        tag = "inf_stk_1")
+
+formula_inla_1 <- y ~ -1 + beta_0 + beta_2 + beta_3 + f(idx_cat, model = "iid", constr = TRUE) + f(sp, model = spde_inf)
+
+inla_model_1 <- inla(data = inla.stack.data(inf_stk_1), formula = formula_inla_1, family = "gaussian",
+                     control.predictor = list(A = inla.stack.A(inf_stk_1)))
+
+idx.fitted <- inla_model_1$summary.fitted.values %>% rownames(.) %>% grepl(pattern = "fitted.APredictor.", x = .)
+e.train <- simdata_train$y - inla_model_1$summary.fitted.values$mean[idx.fitted]
+e.test <- simdata_test$y - (inla_model_1$summary.fixed$mean[1] + 
+                              inla_model_1$summary.fixed$mean[2]*simdata_test$X2 +
+                              inla_model_1$summary.fixed$mean[3]*simdata_test$X3 +
+                              inla_model_1$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] +
+                              drop(fm_basis(x = mesh_inf, loc = coord_strong_test_df) %*% inla_model_1$summary.random$sp$mean))
+```
+
+```{r strong_INLA1_RF1, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Empirical-real density of the predictive errors and the closest-optimal Gaussian PDF."
+#|   - "B. Derivative of KLD(p||q) and KLD value for the empirical and closest-optimal Gaussian ."
+
+# Prediction on test data from INLA model
+
+df_e.train <- data.frame(e = e.train, xcoord = coord_strong_train_df[,1], ycoord = coord_strong_train_df[,2], 
+                         X1 = dfsf_sample_strong$X1[-idx.test], 
+                         X2 = dfsf_sample_strong$X2[-idx.test], 
+                         X3 = dfsf_sample_strong$X3[-idx.test])
+
+# Fitting the residual information with a RF
+
+fit_rf_e.train <- 
+  ranger(formula = e ~ X1 + X2 + X3 + xcoord + ycoord,
+         data = df_e.train,
+         importance = "none",
+         replace = FALSE,
+         seed = seed,
+         oob.error = TRUE) 
+
+# Compute predictions on the left out station (this need to be changed, the code is wrong as it is now)
+y_hat <- predict(fit_rf_e.train, data = data.frame(simdata_test, xcoord = coord_strong_test_df[,1], ycoord = coord_strong_test_df[,2]))$predictions # (this need to be changed, the code is wrong as it is now)
+
+# Compute prediction intervals
+oob_error <- df_e.train$e - fit_rf_e.train$predictions #oob predictions
+
+alpha = 0.05 #for prediction intervals
+lowerPred <- y_hat + quantile(oob_error, alpha/2)
+upperPred <- y_hat + quantile(oob_error, 1 - alpha/2)
+
+dens_oob_error <- density(oob_error)
+dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
+
+# Optimazing only the standard deviation of the optimal Gaussian
+# optim_sd <- optim(par = sd(oob_error), method = "Brent", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = mean(oob_error), sd = x)))))}, lower = 0, upper = 5*sd(oob_error))
+
+# Optimazing the mean and the standard deviation of the optimal Gaussian
+optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+
+ggplot() + 
+  geom_line(data = data.frame(dens_oob_error[c("x", "y")]), mapping = aes(x = x, y = y)) +
+  geom_line(data = data.frame(x = seq(min(dens_oob_error$x),max(dens_oob_error$x),length.out=1E3), y = dnorm(x = seq(min(dens_oob_error$x), max(dens_oob_error$x), length.out = 1E3), mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])),
+            mapping = aes(x = x, y = y), colour = "red") + 
+  labs(title = "Real and optimal Guassian PDF") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+
+ggplot() + geom_line(data = data.frame(x = dens_oob_error$x, y = dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))), 
+                     mapping = aes(x = x, y = y), colour = "blue") + 
+  labs(title = "Derivative of KLD(p||q)", subtitle = sprintf("KLD = %s", formatC(KLD_emp_the, format = "e", digits = 3))) + 
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"),
+                     plot.subtitle = element_markdown(hjust=0.5, face="bold", size=12, color = "black"))
+
+e.test_irf <- simdata_test$y - (inla_model_1$summary.fixed$mean[1] +
+                                  inla_model_1$summary.fixed$mean[2]*dfsf_sample_strong$X2 +
+                                  inla_model_1$summary.fixed$mean[3]*dfsf_sample_strong$X3 +
+                                  inla_model_1$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] + 
+                                  drop(fm_basis(x = mesh_inf, loc = coord_strong_test_df) %*% inla_model_1$summary.random$sp$mean) + 
+                                  y_hat)  # Prediction on test data (INLA+RF) 
+```
+
+```{r strong_INLA1_RF1_table, echo=FALSE, warning=FALSE, message=FALSE}
+kable(x = 
+        data.frame(matrix(data = c(sqrt(mean(e.train**2)), sqrt(mean((oob_error)**2)), 
+                                   sqrt(mean(e.test**2)), sqrt(mean(e.test_irf**2))), ncol = 2),
+                   row.names = c("INLA", "INLA-RF")),
+      caption = "RMSE for the train and test datasets. The obtained values are compared by evaluating the data using INLA and using a combination of INLA and RF, where the geometry of the information is not shared between INLA and RF (running only the first loop of the algorithm).",
+      col.names = c("Train", "Test"),
+      row.names = TRUE, digits = 4, format = "html") %>% kable_paper("hover", full_width = FALSE)
+```
+
+```{r strong_INLA1_RF2, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Empirical-real density of the predictive errors and the closest-optimal Gaussian PDF."
+#|   - "B. Derivative of KLD(p||q) and KLD value for the empirical and closest-optimal Gaussian ."
+
+# Prediction on test data from INLA model
+
+df_e.train <- data.frame(e = e.train, sp = drop(A_sp %*% inla_model_1$summary.random$sp$mean), 
+                         X1 = dfsf_sample_strong$X1[-idx.test], 
+                         X2 = dfsf_sample_strong$X2[-idx.test], 
+                         X3 = dfsf_sample_strong$X3[-idx.test])
+
+# Fitting the residual information with a RF
+
+fit_rf_e.train <- 
+  ranger(formula = e ~ X1 + X2 + X3 + sp,
+         data = df_e.train,
+         importance = "none",
+         replace = FALSE,
+         seed = seed,
+         oob.error = TRUE) 
+
+# Compute predictions on the left out station (this need to be changed, the code is wrong as it is now)
+y_hat <- predict(fit_rf_e.train, 
+                 data = data.frame(simdata_test, 
+                                   sp = drop(fm_basis(x = mesh_inf, loc = coord_strong_test_df) %*% 
+                                               inla_model_1$summary.random$sp$mean)))$predictions # (this need to be changed, the code is wrong as it is now)
+
+# Compute prediction intervals
+oob_error <- df_e.train$e - fit_rf_e.train$predictions #oob predictions
+
+alpha = 0.05 #for prediction intervals
+lowerPred <- y_hat + quantile(oob_error, alpha/2)
+upperPred <- y_hat + quantile(oob_error, 1 - alpha/2)
+
+dens_oob_error <- density(oob_error)
+dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
+
+# Optimazing only the standard deviation of the optimal Gaussian
+# optim_sd <- optim(par = sd(oob_error), method = "Brent", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = mean(oob_error), sd = x)))))}, lower = 0, upper = 5*sd(oob_error))
+
+# Optimazing the mean and the standard deviation of the optimal Gaussian
+optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+
+ggplot() + 
+  geom_line(data = data.frame(dens_oob_error[c("x", "y")]), mapping = aes(x = x, y = y)) +
+  geom_line(data = data.frame(x = seq(min(dens_oob_error$x),max(dens_oob_error$x),length.out=1E3), y = dnorm(x = seq(min(dens_oob_error$x), max(dens_oob_error$x), length.out = 1E3), mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])),
+            mapping = aes(x = x, y = y), colour = "red") + 
+  labs(title = "Real and optimal Guassian PDF") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+
+ggplot() + geom_line(data = data.frame(x = dens_oob_error$x, y = dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))), 
+                     mapping = aes(x = x, y = y), colour = "blue") + 
+  labs(title = "Derivative of KLD(p||q)", subtitle = sprintf("KLD = %s", formatC(KLD_emp_the, format = "e", digits = 3))) + 
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"),
+                     plot.subtitle = element_markdown(hjust=0.5, face="bold", size=12, color = "black"))
+
+
+e.test_irf <- simdata_test$y - (inla_model_1$summary.fixed$mean[1] +
+                                  inla_model_1$summary.fixed$mean[2]*dfsf_sample_strong$X2 +
+                                  inla_model_1$summary.fixed$mean[3]*dfsf_sample_strong$X3 +
+                                  inla_model_1$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] + 
+                                  drop(fm_basis(x = mesh_inf, loc = coord_strong_test_df) %*% inla_model_1$summary.random$sp$mean) + 
+                                  y_hat)  # Prediction on test data (INLA+RF) 
+```
+
+```{r strong_INLA1_RF2_table, echo=FALSE, warning=FALSE, message=FALSE}
+kable(x = 
+        data.frame(matrix(data = c(sqrt(mean(e.train**2)), sqrt(mean((oob_error)**2)), 
+                                   sqrt(mean(e.test**2)), sqrt(mean(e.test_irf**2))), ncol = 2),
+                   row.names = c("INLA", "INLA-RF")),
+      caption = "RMSE for the train and test datasets. The obtained values are compared by evaluating the data using INLA and using a combination of INLA and RF, where the geometry of the information is shared between INLA and RF (running only the first loop of the algorithm).",
+      col.names = c("Train", "Test"),
+      row.names = TRUE, digits = 4, format = "html") %>% kable_paper("hover", full_width = FALSE)
+```
+
+### Complex INLA model and RF combined analysis, sharing geometry information (first loop only)
+
+```{r strong_Inference_INLA_strong_cov_INLA2, echo=FALSE, warning=FALSE, message=FALSE}
+# Building the groups for the non-linear effects of the covariates
+X2.group <- inla.group(x = dfsf_sample_strong$X2, n = 25, method = "quantile")
+X3.group <- inla.group(x = dfsf_sample_strong$X3, n = 25, method = "quantile")
+X2.group_uniq <- unique(X2.group)
+X3.group_uniq <- unique(X3.group)
+
+# Building sparseMatrix for the projector of X2 -> fX2 non-linear effect
+AX2_r <- rep(0, times = length(unique(X2.group)))
+X2_train <- X2.group[-idx.test]
+AX2 <- mclapply(X = 1:length(X2_train), mc.cores = 8, FUN = function(i){
+  idx <- which(X2_train[i] == X2.group_uniq)
+  AX2_r[idx] <- 1
+  return(AX2_r)
+}) %>% do.call(., what = rbind) %>% as(., "sparseMatrix")
+
+# Building sparseMatrix for the projector of X3 -> fX3 non-linear effect
+AX3_r <- rep(0, times = length(unique(X3.group)))
+X3_train <- X3.group[-idx.test]
+AX3 <- mclapply(X = 1:length(X3_train), mc.cores = 8, FUN = function(i){
+  idx <- which(X3_train[i] == X3.group_uniq)
+  AX3_r[idx] <- 1
+  return(AX3_r)
+  }) %>% do.call(., what = rbind) %>% as(., "sparseMatrix")
+
+inf_stk_2 <- inla.stack(data = list(y = simdata_train$y), # list(y = rep(NA, times = length(dfsf_sample_strong$y))),
+                        A = list(A_sp, 1, AX2, AX3), 
+                        effects = list(
+                          list(sp = 1:mesh_inf$n),
+                          list(
+                            beta_0 = rep(1, nrow(simdata_train)),
+                            idx_cat = as.numeric(simdata_train$X1)),
+                          list(beta_2 = X2.group_uniq),
+                          list(beta_3 = X3.group_uniq)
+                          ),
+                        remove.unused = FALSE,
+                        tag = "inf_stk_2")
+
+formula_inla_2 <- y ~ -1 + 
+  beta_0 + 
+  f(beta_2, model = "rw2", constr = TRUE) + 
+  f(beta_3, model = "rw2", constr = TRUE) + 
+  f(idx_cat, model = "iid", constr = TRUE) + f(sp, model = spde_inf)
+
+inla_model_2 <- inla(data = inla.stack.data(inf_stk_2),
+                     formula = formula_inla_2, family = "gaussian",
+                     control.predictor = list(A = inla.stack.A(inf_stk_2)))
+
+idx.fitted <- inla_model_2$summary.fitted.values %>% rownames(.) %>% grepl(pattern = "fitted.APredictor.", x = .)
+e.train <- simdata_train$y - inla_model_2$summary.fitted.values$mean[idx.fitted]
+e.test <- simdata_test$y - (inla_model_2$summary.fixed$mean + 
+  inla_model_2$summary.random$beta_2$mean[match(X2.group[idx.test], inla_model_2$summary.random$beta_2$ID)] +
+  inla_model_2$summary.random$beta_3$mean[match(X3.group[idx.test], inla_model_2$summary.random$beta_3$ID)] +
+  inla_model_2$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] +
+  drop(fm_basis(x = mesh_inf, loc = coord_strong_test_df) %*% inla_model_2$summary.random$sp$mean)) # Prediction on test data 
+```
+
+```{r plot_weak_INLA_strong_cov_INLA2, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Simulated (red) and inferred (black) non-linear effect (X2) in the strong non-linearity scenario. The inferred effect shows the mean of the posterior distribution in a solid black line and the credible interval (q1-q3) is shown with a gray shadow area."
+#|   - "B. Simulated (red) and inferred (black) non-linear effect (X3) in the strong non-linearity scenario. The inferred effect shows the mean of the posterior distribution in a solid black line and the credible interval (q1-q3) is shown with a gray shadow area."
+
+ggplot() + 
+  geom_line(data = inla_model_2$summary.random$beta_2, mapping = aes(x = ID, y = mean)) +
+  geom_ribbon(data = inla_model_2$summary.random$beta_2 %>% rename(., all_of(c(q1 = '0.025quant', q3 = '0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), alpha = 0.4) +
+  geom_line(data = dfsf_sample_strong, mapping = aes(x = X2, y = fX2), colour = "red") +
+  labs(title = "Simulated and estimated effect (X2)") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+ggplot() + 
+  geom_line(data = inla_model_2$summary.random$beta_3, mapping = aes(x = ID, y = mean)) +
+  geom_ribbon(data = inla_model_2$summary.random$beta_3 %>% rename(., all_of(c(q1 = '0.025quant', q3 = '0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), alpha = 0.4) +
+  geom_line(data = dfsf_sample_strong, mapping = aes(x = X3, y = fX3), colour = "red") +
+  labs(title = "Simulated and estimated effect (X3)") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+```
+
+```{r strong_INLA2_RF1, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Empirical-real density of the predictive errors and the closest-optimal Gaussian PDF."
+#|   - "B. Derivative of KLD(p||q) and KLD value for the empirical and closest-optimal Gaussian ."
+
+# Prediction on test data from INLA model
+
+df_e.train <- data.frame(e = e.train, xcoord = coord_strong_train_df[,1], ycoord = coord_strong_train_df[,2], 
+                         X1 = dfsf_sample_strong$X1[-idx.test],
+                         X2 = dfsf_sample_strong$X2[-idx.test],
+                         X3 = dfsf_sample_strong$X3[-idx.test])
+
+# Fitting the residual information with a RF
+
+fit_rf_e.train <- 
+  ranger(formula = e ~ X1 + X2 + X3 + xcoord + ycoord,
+         data = df_e.train,
+         importance = "none",
+         replace = FALSE,
+         seed = seed,
+         oob.error = TRUE)
+
+# Compute predictions on the left out station (this need to be changed, the code is wrong as it is now)
+y_hat <- predict(fit_rf_e.train, data = data.frame(simdata_test, xcoord = coord_strong_test_df[,1], ycoord = coord_strong_test_df[,2]))$predictions # (this need to be changed, the code is wrong as it is now)
+
+# Compute prediction intervals
+oob_error <- df_e.train$e - fit_rf_e.train$predictions #oob predictions
+
+alpha = 0.05 #for prediction intervals
+lowerPred <- y_hat + quantile(oob_error, alpha/2)
+upperPred <- y_hat + quantile(oob_error, 1 - alpha/2)
+
+dens_oob_error <- density(oob_error)
+dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
+
+# Optimazing only the standard deviation of the optimal Gaussian
+# optim_sd <- optim(par = sd(oob_error), method = "Brent", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = mean(oob_error), sd = x)))))}, lower = 0, upper = 5*sd(oob_error))
+
+# Optimazing the mean and the standard deviation of the optimal Gaussian
+optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+
+ggplot() + 
+  geom_line(data = data.frame(dens_oob_error[c("x", "y")]), mapping = aes(x = x, y = y)) +
+  geom_line(data = data.frame(x = seq(min(dens_oob_error$x),max(dens_oob_error$x),length.out=1E3), y = dnorm(x = seq(min(dens_oob_error$x), max(dens_oob_error$x), length.out = 1E3), mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])),
+            mapping = aes(x = x, y = y), colour = "red") + 
+  labs(title = "Real and optimal Guassian PDF") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+
+ggplot() + geom_line(data = data.frame(x = dens_oob_error$x, y = dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))), 
+                     mapping = aes(x = x, y = y), colour = "blue") + 
+  labs(title = "Derivative of KLD(p||q)", subtitle = sprintf("KLD = %s", formatC(KLD_emp_the, format = "e", digits = 3))) + 
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"),
+                     plot.subtitle = element_markdown(hjust=0.5, face="bold", size=12, color = "black"))
+
+e.test_irf <- simdata_test$y - (inla_model_2$summary.fixed$mean +
+                                  inla_model_2$summary.random$beta_2$mean[match(X2.group[idx.test], inla_model_2$summary.random$beta_2$ID)] +
+                                  inla_model_2$summary.random$beta_3$mean[match(X3.group[idx.test], inla_model_2$summary.random$beta_3$ID)] +
+                                  inla_model_2$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] + 
+                                  drop(fm_basis(x = mesh_inf, loc = coord_strong_test_df) %*% inla_model_2$summary.random$sp$mean) + 
+                                  y_hat)  # Prediction on test data (INLA+RF) 
+```
+
+```{r strong_INLA2_RF1_table, echo=FALSE, warning=FALSE, message=FALSE}
+kable(x = 
+        data.frame(matrix(data = c(sqrt(mean(e.train**2)), sqrt(mean((oob_error)**2)), 
+                                   sqrt(mean(e.test**2)), sqrt(mean(e.test_irf**2))), ncol = 2),
+                   row.names = c("INLA", "INLA-RF")),
+      caption = "RMSE for the train and test datasets. The obtained values are compared by evaluating the data using INLA and using a combination of INLA and RF, where the geometry of the information is not shared between INLA and RF (running only the first loop of the algorithm).",
+      col.names = c("Train", "Test"),
+      row.names = TRUE, digits = 4, format = "html") %>% kable_paper("hover", full_width = FALSE)
+```
+
+```{r strong_INLA2_RF2, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Empirical-real density of the predictive errors and the closest-optimal Gaussian PDF."
+#|   - "B. Derivative of KLD(p||q) and KLD value for the empirical and closest-optimal Gaussian ."
+
+# Prediction on test data from INLA model
+
+df_e.train <- data.frame(e = e.train, sp = drop(A_sp %*% inla_model_2$summary.random$sp$mean), 
+                         X1 = dfsf_sample_strong$X1[-idx.test],
+                         X2 = inla_model_2$summary.random$beta_2$mean[match(X2.group[-idx.test], inla_model_2$summary.random$beta_2$ID)],
+                         X3 = inla_model_2$summary.random$beta_3$mean[match(X3.group[-idx.test], inla_model_2$summary.random$beta_3$ID)])
+
+# Fitting the residual information with a RF
+
+fit_rf_e.train <- 
+  ranger(formula = e ~ X1 + X2 + X3 + sp,
+         data = df_e.train,
+         importance = "none",
+         replace = FALSE,
+         seed = seed,
+         oob.error = TRUE)
+
+# Compute predictions on the left out station (this need to be changed, the code is wrong as it is now)
+pred_simdata_test <- data.frame(y = NA, X1 = simdata_test$X1, 
+                                X2 = inla_model_2$summary.random$beta_2$mean[match(X2.group[idx.test], inla_model_2$summary.random$beta_2$ID)],
+                                X3 = inla_model_2$summary.random$beta_3$mean[match(X3.group[idx.test], inla_model_2$summary.random$beta_3$ID)],
+                                sp = drop(fm_basis(x = mesh_inf, loc = coord_strong_test_df) %*% inla_model_2$summary.random$sp$mean))
+y_hat <- predict(fit_rf_e.train, data = pred_simdata_test)$predictions # (this need to be changed, the code is wrong as it is now)
+
+# Compute prediction intervals
+oob_error <- df_e.train$e - fit_rf_e.train$predictions #oob predictions
+
+alpha = 0.05 #for prediction intervals
+lowerPred <- y_hat + quantile(oob_error, alpha/2)
+upperPred <- y_hat + quantile(oob_error, 1 - alpha/2)
+
+dens_oob_error <- density(oob_error)
+dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
+
+# Optimazing only the standard deviation of the optimal Gaussian
+# optim_sd <- optim(par = sd(oob_error), method = "Brent", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = mean(oob_error), sd = x)))))}, lower = 0, upper = 5*sd(oob_error))
+
+# Optimazing the mean and the standard deviation of the optimal Gaussian
+optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+
+ggplot() + 
+  geom_line(data = data.frame(dens_oob_error[c("x", "y")]), mapping = aes(x = x, y = y)) +
+  geom_line(data = data.frame(x = seq(min(dens_oob_error$x),max(dens_oob_error$x),length.out=1E3), y = dnorm(x = seq(min(dens_oob_error$x), max(dens_oob_error$x), length.out = 1E3), mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])),
+            mapping = aes(x = x, y = y), colour = "red") + 
+  labs(title = "Real and optimal Guassian PDF") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+
+ggplot() + geom_line(data = data.frame(x = dens_oob_error$x, y = dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))), 
+                     mapping = aes(x = x, y = y), colour = "blue") + 
+  labs(title = "Derivative of KLD(p||q)", subtitle = sprintf("KLD = %s", formatC(KLD_emp_the, format = "e", digits = 3))) + 
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"),
+                     plot.subtitle = element_markdown(hjust=0.5, face="bold", size=12, color = "black"))
+
+e.test_irf <- simdata_test$y - (inla_model_2$summary.fixed$mean +
+                                  inla_model_2$summary.random$beta_2$mean[match(X2.group[idx.test], inla_model_2$summary.random$beta_2$ID)] +
+                                  inla_model_2$summary.random$beta_3$mean[match(X3.group[idx.test], inla_model_2$summary.random$beta_3$ID)] +
+                                  inla_model_2$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] + 
+                                  drop(fm_basis(x = mesh_inf, loc = coord_strong_test_df) %*% inla_model_2$summary.random$sp$mean) + 
+                                  y_hat)  # Prediction on test data (INLA+RF) 
+```
+
+```{r strong_INLA2_RF2_table, echo=FALSE, warning=FALSE, message=FALSE}
+kable(x = 
+        data.frame(matrix(data = c(sqrt(mean(e.train**2)), sqrt(mean((oob_error)**2)), 
+                                   sqrt(mean(e.test**2)), sqrt(mean(e.test_irf**2))), ncol = 2),
+                   row.names = c("INLA", "INLA-RF")),
+      caption = "RMSE for the train and test datasets. The obtained values are compared by evaluating the data using INLA and using a combination of INLA and RF, where the geometry of the information is not shared between INLA and RF (running only the first loop of the algorithm).",
+      col.names = c("Train", "Test"),
+      row.names = TRUE, digits = 4, format = "html") %>% kable_paper("hover", full_width = FALSE)
+```
+
+## Analysis of the data under the weak non-linearity case
+
+### Simple INLA model and RF combined analysis (first loop only)
+
+```{r weak_Inference_weak_cov_INLA_setup, echo=FALSE, warning=FALSE, message=FALSE}
+## Creating the train/test groups ----
+idx.test <- sample(x = 1:nrow(dfsf_sample_weak), size = round(nrow(dfsf_sample_weak)*0.2))
+simdata_train <- dfsf_sample_weak[-idx.test,]
+simdata_test <- dfsf_sample_weak[idx.test,]
+
+## INLA settings ----
+
+coord_weak_df <- st_coordinates(dfsf_sample_weak)
+coord_weak_train_df <- st_coordinates(simdata_train)
+coord_weak_test_df <- st_coordinates(simdata_test)
+
+idx_chull <- chull(x = coord_weak_df)
+st_chull <- st_polygon(x = list(coord_weak_df[c(idx_chull, idx_chull[1]),]))
+
+mesh_inf <- fm_mesh_2d_inla(boundary = list(st_chull), max.edge = c(0.15, 0.5), offset = c(0.01, -0.1))
+
+rho_0 <- st_coordinates(st_chull)[,1:2] %>% dist(.) %>% max(.)/5
+spde_inf <- inla.spde2.pcmatern(mesh = mesh_inf, alpha = 2, prior.range = c(rho_0, 0.5), prior.sigma = c(1, 0.5), constr = TRUE)
+A_sp <- fm_basis(x = mesh_inf, loc = coord_weak_train_df)
+```
+
+```{r weak_Inference_INLA_weak_cov_INLA1, echo=FALSE, warning=FALSE, message=FALSE}
+inf_stk_1 <- inla.stack(data = list(y = simdata_train$y),
+                        A = list(A_sp, 1), 
+                        effects = list(
+                          list(sp = 1:mesh_inf$n),
+                          list(
+                            beta_0 = rep(1, nrow(simdata_train)),
+                            idx_cat = as.numeric(simdata_train$X1),
+                            beta_2 = simdata_train$X2,
+                            beta_3 = simdata_train$X3
+                          )
+                        ),
+                        tag = "inf_stk_1")
+
+formula_inla_1 <- y ~ -1 + beta_0 + beta_2 + beta_3 + f(idx_cat, model = "iid", constr = TRUE) + f(sp, model = spde_inf)
+
+inla_model_1 <- inla(data = inla.stack.data(inf_stk_1), formula = formula_inla_1, family = "gaussian",
+                     control.predictor = list(A = inla.stack.A(inf_stk_1)))
+
+idx.fitted <- inla_model_1$summary.fitted.values %>% rownames(.) %>% grepl(pattern = "fitted.APredictor.", x = .)
+e.train <- simdata_train$y - inla_model_1$summary.fitted.values$mean[idx.fitted]
+e.test <- simdata_test$y - (inla_model_1$summary.fixed$mean[1] + 
+                              inla_model_1$summary.fixed$mean[2]*simdata_test$X2 +
+                              inla_model_1$summary.fixed$mean[3]*simdata_test$X3 +
+                              inla_model_1$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] +
+                              drop(fm_basis(x = mesh_inf, loc = coord_weak_test_df) %*% inla_model_1$summary.random$sp$mean))
+```
+
+```{r weak_INLA1_RF1, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Empirical-real density of the predictive errors and the closest-optimal Gaussian PDF."
+#|   - "B. Derivative of KLD(p||q) and KLD value for the empirical and closest-optimal Gaussian ."
+
+# Prediction on test data from INLA model
+
+df_e.train <- data.frame(e = e.train, xcoord = coord_weak_train_df[,1], ycoord = coord_weak_train_df[,2], 
+                         X1 = dfsf_sample_weak$X1[-idx.test], 
+                         X2 = dfsf_sample_weak$X2[-idx.test], 
+                         X3 = dfsf_sample_weak$X3[-idx.test])
+
+# Fitting the residual information with a RF
+
+fit_rf_e.train <- 
+  ranger(formula = e ~ X1 + X2 + X3 + xcoord + ycoord,
+         data = df_e.train,
+         importance = "none",
+         replace = FALSE,
+         seed = seed,
+         oob.error = TRUE) 
+
+# Compute predictions on the left out station (this need to be changed, the code is wrong as it is now)
+y_hat <- predict(fit_rf_e.train, data = data.frame(simdata_test %>% st_drop_geometry(.), xcoord = coord_weak_test_df[,1], ycoord = coord_weak_test_df[,2]))$predictions # (this need to be changed, the code is wrong as it is now)
+
+# Compute prediction intervals
+oob_error <- df_e.train$e - fit_rf_e.train$predictions #oob predictions
+
+alpha = 0.05 #for prediction intervals
+lowerPred <- y_hat + quantile(oob_error, alpha/2)
+upperPred <- y_hat + quantile(oob_error, 1 - alpha/2)
+
+dens_oob_error <- density(oob_error)
+dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
+
+# Optimazing only the standard deviation of the optimal Gaussian
+# optim_sd <- optim(par = sd(oob_error), method = "Brent", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = mean(oob_error), sd = x)))))}, lower = 0, upper = 5*sd(oob_error))
+
+# Optimazing the mean and the standard deviation of the optimal Gaussian
+optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+
+ggplot() + 
+  geom_line(data = data.frame(dens_oob_error[c("x", "y")]), mapping = aes(x = x, y = y)) +
+  geom_line(data = data.frame(x = seq(min(dens_oob_error$x),max(dens_oob_error$x),length.out=1E3), y = dnorm(x = seq(min(dens_oob_error$x), max(dens_oob_error$x), length.out = 1E3), mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])),
+            mapping = aes(x = x, y = y), colour = "red") + 
+  labs(title = "Real and optimal Guassian PDF") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+
+ggplot() + geom_line(data = data.frame(x = dens_oob_error$x, y = dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))), 
+                     mapping = aes(x = x, y = y), colour = "blue") + 
+  labs(title = "Derivative of KLD(p||q)", subtitle = sprintf("KLD = %s", formatC(KLD_emp_the, format = "e", digits = 3))) + 
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"),
+                     plot.subtitle = element_markdown(hjust=0.5, face="bold", size=12, color = "black"))
+
+e.test_irf <- simdata_test$y - (inla_model_1$summary.fixed$mean[1] +
+                                  inla_model_1$summary.fixed$mean[2]*simdata_test$X2 +
+                                  inla_model_1$summary.fixed$mean[3]*simdata_test$X3 +
+                                  inla_model_1$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] + 
+                                  drop(fm_basis(x = mesh_inf, loc = coord_weak_test_df) %*% inla_model_1$summary.random$sp$mean) + 
+                                  y_hat)  # Prediction on test data (INLA+RF) 
+```
+
+```{r weak_INLA1_RF1_table, echo=FALSE, warning=FALSE, message=FALSE}
+kable(x = 
+        data.frame(matrix(data = c(sqrt(mean(e.train**2)), sqrt(mean((oob_error)**2)), 
+                                   sqrt(mean(e.test**2)), sqrt(mean(e.test_irf**2))), ncol = 2),
+                   row.names = c("INLA", "INLA-RF")),
+      caption = "RMSE for the train and test datasets. The obtained values are compared by evaluating the data using INLA and using a combination of INLA and RF, where the geometry of the information is not shared between INLA and RF (running only the first loop of the algorithm).",
+      col.names = c("Train", "Test"),
+      row.names = TRUE, digits = 4, format = "html") %>% kable_paper("hover", full_width = FALSE)
+```
+
+```{r weak_INLA1_RF2, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Empirical-real density of the predictive errors and the closest-optimal Gaussian PDF."
+#|   - "B. Derivative of KLD(p||q) and KLD value for the empirical and closest-optimal Gaussian ."
+
+# Prediction on test data from INLA model
+
+df_e.train <- data.frame(e = e.train, sp = drop(A_sp %*% inla_model_1$summary.random$sp$mean), 
+                         X1 = dfsf_sample_weak$X1[-idx.test], 
+                         X2 = dfsf_sample_weak$X2[-idx.test], 
+                         X3 = dfsf_sample_weak$X3[-idx.test])
+
+# Fitting the residual information with a RF
+
+fit_rf_e.train <- 
+  ranger(formula = e ~ X1 + X2 + X3 + sp,
+         data = df_e.train,
+         importance = "none",
+         replace = FALSE,
+         seed = seed,
+         oob.error = TRUE) 
+
+# Compute predictions on the left out station (this need to be changed, the code is wrong as it is now)
+y_hat <- predict(fit_rf_e.train, 
+                 data = data.frame(simdata_test, 
+                                   sp = drop(fm_basis(x = mesh_inf, loc = coord_weak_test_df) %*% 
+                                               inla_model_1$summary.random$sp$mean)))$predictions # (this need to be changed, the code is wrong as it is now)
+
+# Compute prediction intervals
+oob_error <- df_e.train$e - fit_rf_e.train$predictions #oob predictions
+
+alpha = 0.05 #for prediction intervals
+lowerPred <- y_hat + quantile(oob_error, alpha/2)
+upperPred <- y_hat + quantile(oob_error, 1 - alpha/2)
+
+dens_oob_error <- density(oob_error)
+dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
+
+# Optimazing only the standard deviation of the optimal Gaussian
+# optim_sd <- optim(par = sd(oob_error), method = "Brent", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = mean(oob_error), sd = x)))))}, lower = 0, upper = 5*sd(oob_error))
+
+# Optimazing the mean and the standard deviation of the optimal Gaussian
+optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+
+ggplot() + 
+  geom_line(data = data.frame(dens_oob_error[c("x", "y")]), mapping = aes(x = x, y = y)) +
+  geom_line(data = data.frame(x = seq(min(dens_oob_error$x),max(dens_oob_error$x),length.out=1E3), y = dnorm(x = seq(min(dens_oob_error$x), max(dens_oob_error$x), length.out = 1E3), mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])),
+            mapping = aes(x = x, y = y), colour = "red") + 
+  labs(title = "Real and optimal Guassian PDF") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+
+ggplot() + geom_line(data = data.frame(x = dens_oob_error$x, y = dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))), 
+                     mapping = aes(x = x, y = y), colour = "blue") + 
+  labs(title = "Derivative of KLD(p||q)", subtitle = sprintf("KLD = %s", formatC(KLD_emp_the, format = "e", digits = 3))) + 
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"),
+                     plot.subtitle = element_markdown(hjust=0.5, face="bold", size=12, color = "black"))
+
+
+e.test_irf <- simdata_test$y - (inla_model_1$summary.fixed$mean[1] +
+                                  inla_model_1$summary.fixed$mean[2]*simdata_test$X2 +
+                                  inla_model_1$summary.fixed$mean[3]*simdata_test$X3 +
+                                  inla_model_1$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] + 
+                                  drop(fm_basis(x = mesh_inf, loc = coord_weak_test_df) %*% inla_model_1$summary.random$sp$mean) + 
+                                  y_hat)  # Prediction on test data (INLA+RF) 
+```
+
+```{r weak_INLA1_RF2_table, echo=FALSE, warning=FALSE, message=FALSE}
+kable(x = 
+        data.frame(matrix(data = c(sqrt(mean(e.train**2)), sqrt(mean((oob_error)**2)), 
+                                   sqrt(mean(e.test**2)), sqrt(mean(e.test_irf**2))), ncol = 2),
+                   row.names = c("INLA", "INLA-RF")),
+      caption = "RMSE for the train and test datasets. The obtained values are compared by evaluating the data using INLA and using a combination of INLA and RF, where the geometry of the information is shared between INLA and RF (running only the first loop of the algorithm).",
+      col.names = c("Train", "Test"),
+      row.names = TRUE, digits = 4, format = "html") %>% kable_paper("hover", full_width = FALSE)
+```
+
+### Complex INLA model and RF combined analysis, sharing geometry information (first loop only)
+
+```{r weak_Inference_INLA_weak_cov_INLA2, echo=FALSE, warning=FALSE, message=FALSE}
+# Building the groups for the non-linear effects of the covariates
+X2.group <- inla.group(x = dfsf_sample_weak$X2, n = 20, method = "quantile")
+X2.group_uniq <- unique(X2.group)
+
+# Building sparseMatrix for the projector of X3 -> fX3 non-linear effect
+AX2_r <- rep(0, times = length(unique(X2.group)))
+X2_train <- X2.group[-idx.test]
+AX2 <- mclapply(X = 1:length(X2_train), mc.cores = 8, FUN = function(i){
+  idx <- which(X2_train[i] == X2.group_uniq)
+  AX2_r[idx] <- 1
+  return(AX2_r)
+  }) %>% do.call(., what = rbind) %>% as(., "sparseMatrix")
+
+inf_stk_2 <- inla.stack(data = list(y = simdata_train$y), # list(y = rep(NA, times = length(dfsf_sample_weak$y))),
+                        A = list(A_sp, 1, AX2), 
+                        effects = list(
+                          list(sp = 1:mesh_inf$n),
+                          list(
+                            beta_0 = rep(1, nrow(simdata_train)),
+                            idx_cat = as.numeric(simdata_train$X1),
+                            beta_3 = simdata_train$X3),
+                          list(beta_2 = X2.group_uniq)
+                          ),
+                        remove.unused = FALSE,
+                        tag = "inf_stk_2")
+
+formula_inla_2 <- y ~ -1 + 
+  beta_0 + 
+  beta_3 +
+  f(beta_2, model = "rw2", constr = TRUE) + 
+  f(idx_cat, model = "iid", constr = TRUE) + f(sp, model = spde_inf)
+
+inla_model_2 <- inla(data = inla.stack.data(inf_stk_2),
+                     formula = formula_inla_2, family = "gaussian",
+                     control.predictor = list(A = inla.stack.A(inf_stk_2)))
+
+idx.fitted <- inla_model_2$summary.fitted.values %>% rownames(.) %>% grepl(pattern = "fitted.APredictor.", x = .)
+e.train <- simdata_train$y - inla_model_2$summary.fitted.values$mean[idx.fitted]
+e.test <- simdata_test$y - (inla_model_2$summary.fixed$mean[1] + inla_model_2$summary.fixed$mean[2]*simdata_test$X3 +
+  inla_model_2$summary.random$beta_2$mean[match(X2.group[idx.test], inla_model_2$summary.random$beta_2$ID)] +
+  inla_model_2$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] +
+  drop(fm_basis(x = mesh_inf, loc = coord_weak_test_df) %*% inla_model_2$summary.random$sp$mean)) # Prediction on test data 
+```
+
+```{r plot_weak_INLA_weak_cov_INLA2, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 1
+#| fig-cap:
+#|   - "A. Simulated (red) and inferred (black) non-linear effect (X2) in the weak non-linearity scenario. The inferred effect shows the mean of the posterior distribution in a solid black line and the credible interval (q1-q3) is shown with a gray shadow area."
+
+ggplot() + 
+  geom_line(data = inla_model_2$summary.random$beta_2, mapping = aes(x = ID, y = mean)) +
+  geom_ribbon(data = inla_model_2$summary.random$beta_2 %>% rename(., all_of(c(q1 = '0.025quant', q3 = '0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), alpha = 0.4) +
+  geom_line(data = dfsf_sample_weak, mapping = aes(x = X2, y = fX2), colour = "red") +
+  labs(title = "Simulated and estimated effect (X2)") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+```
+
+```{r weak_INLA2_RF1, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Empirical-real density of the predictive errors and the closest-optimal Gaussian PDF."
+#|   - "B. Derivative of KLD(p||q) and KLD value for the empirical and closest-optimal Gaussian ."
+
+# Prediction on test data from INLA model
+
+df_e.train <- data.frame(e = e.train, xcoord = coord_weak_train_df[,1], ycoord = coord_weak_train_df[,2], 
+                         X1 = dfsf_sample_weak$X1[-idx.test],
+                         X2 = dfsf_sample_weak$X2[-idx.test],
+                         X3 = dfsf_sample_weak$X3[-idx.test])
+
+# Fitting the residual information with a RF
+
+fit_rf_e.train <- 
+  ranger(formula = e ~ X1 + X2 + X3 + xcoord + ycoord,
+         data = df_e.train,
+         importance = "none",
+         replace = FALSE,
+         seed = seed,
+         oob.error = TRUE)
+
+# Compute predictions on the left out station (this need to be changed, the code is wrong as it is now)
+y_hat <- predict(fit_rf_e.train, data = data.frame(simdata_test, xcoord = coord_weak_test_df[,1], ycoord = coord_weak_test_df[,2]))$predictions # (this need to be changed, the code is wrong as it is now)
+
+# Compute prediction intervals
+oob_error <- df_e.train$e - fit_rf_e.train$predictions #oob predictions
+
+alpha = 0.05 #for prediction intervals
+lowerPred <- y_hat + quantile(oob_error, alpha/2)
+upperPred <- y_hat + quantile(oob_error, 1 - alpha/2)
+
+dens_oob_error <- density(oob_error)
+dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
+
+# Optimazing only the standard deviation of the optimal Gaussian
+# optim_sd <- optim(par = sd(oob_error), method = "Brent", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = mean(oob_error), sd = x)))))}, lower = 0, upper = 5*sd(oob_error))
+
+# Optimazing the mean and the standard deviation of the optimal Gaussian
+optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+
+ggplot() + 
+  geom_line(data = data.frame(dens_oob_error[c("x", "y")]), mapping = aes(x = x, y = y)) +
+  geom_line(data = data.frame(x = seq(min(dens_oob_error$x),max(dens_oob_error$x),length.out=1E3), y = dnorm(x = seq(min(dens_oob_error$x), max(dens_oob_error$x), length.out = 1E3), mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])),
+            mapping = aes(x = x, y = y), colour = "red") + 
+  labs(title = "Real and optimal Guassian PDF") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+
+ggplot() + geom_line(data = data.frame(x = dens_oob_error$x, y = dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))), 
+                     mapping = aes(x = x, y = y), colour = "blue") + 
+  labs(title = "Derivative of KLD(p||q)", subtitle = sprintf("KLD = %s", formatC(KLD_emp_the, format = "e", digits = 3))) + 
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"),
+                     plot.subtitle = element_markdown(hjust=0.5, face="bold", size=12, color = "black"))
+
+e.test_irf <- simdata_test$y - (inla_model_2$summary.fixed$mean[1] +
+                                  inla_model_2$summary.fixed$mean[2]*dfsf_sample_weak$X3[idx.test] +
+                                  inla_model_2$summary.random$beta_2$mean[match(X2.group[idx.test], inla_model_2$summary.random$beta_2$ID)] +
+                                  inla_model_2$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] + 
+                                  drop(fm_basis(x = mesh_inf, loc = coord_weak_test_df) %*% inla_model_2$summary.random$sp$mean) + 
+                                  y_hat)  # Prediction on test data (INLA+RF) 
+```
+
+```{r weak_INLA2_RF1_table, echo=FALSE, warning=FALSE, message=FALSE}
+kable(x = 
+        data.frame(matrix(data = c(sqrt(mean(e.train**2)), sqrt(mean((oob_error)**2)), 
+                                   sqrt(mean(e.test**2)), sqrt(mean(e.test_irf**2))), ncol = 2),
+                   row.names = c("INLA", "INLA-RF")),
+      caption = "RMSE for the train and test datasets. The obtained values are compared by evaluating the data using INLA and using a combination of INLA and RF, where the geometry of the information is not shared between INLA and RF (running only the first loop of the algorithm).",
+      col.names = c("Train", "Test"),
+      row.names = TRUE, digits = 4, format = "html") %>% kable_paper("hover", full_width = FALSE)
+```
+
+```{r weak_INLA2_RF2, echo=FALSE, warning=FALSE, message=FALSE}
+#| layout-ncol: 2
+#| fig-cap:
+#|   - "A. Empirical-real density of the predictive errors and the closest-optimal Gaussian PDF."
+#|   - "B. Derivative of KLD(p||q) and KLD value for the empirical and closest-optimal Gaussian ."
+
+# Prediction on test data from INLA model
+
+df_e.train <- data.frame(e = e.train, sp = drop(A_sp %*% inla_model_2$summary.random$sp$mean), 
+                         X1 = dfsf_sample_weak$X1[-idx.test],
+                         X3 = dfsf_sample_weak$X2[-idx.test],
+                         X2 = inla_model_2$summary.random$beta_2$mean[match(X2.group[-idx.test], inla_model_2$summary.random$beta_2$ID)])
+
+# Fitting the residual information with a RF
+
+fit_rf_e.train <- 
+  ranger(formula = e ~ X1 + X2 + X3 + sp,
+         data = df_e.train,
+         importance = "none",
+         replace = FALSE,
+         seed = seed,
+         oob.error = TRUE)
+
+# Compute predictions on the left out station (this need to be changed, the code is wrong as it is now)
+pred_simdata_test <- data.frame(y = NA, X1 = simdata_test$X1, 
+                                X3 = dfsf_sample_weak$X3[idx.test],
+                                X2 = inla_model_2$summary.random$beta_2$mean[match(X2.group[idx.test], inla_model_2$summary.random$beta_2$ID)],
+                                sp = drop(fm_basis(x = mesh_inf, loc = coord_weak_test_df) %*% inla_model_2$summary.random$sp$mean))
+y_hat <- predict(fit_rf_e.train, data = pred_simdata_test)$predictions # (this need to be changed, the code is wrong as it is now)
+
+# Compute prediction intervals
+oob_error <- df_e.train$e - fit_rf_e.train$predictions #oob predictions
+
+alpha = 0.05 #for prediction intervals
+lowerPred <- y_hat + quantile(oob_error, alpha/2)
+upperPred <- y_hat + quantile(oob_error, 1 - alpha/2)
+
+dens_oob_error <- density(oob_error)
+dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
+
+# Optimazing only the standard deviation of the optimal Gaussian
+# optim_sd <- optim(par = sd(oob_error), method = "Brent", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = mean(oob_error), sd = x)))))}, lower = 0, upper = 5*sd(oob_error))
+
+# Optimazing the mean and the standard deviation of the optimal Gaussian
+optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+
+ggplot() + 
+  geom_line(data = data.frame(dens_oob_error[c("x", "y")]), mapping = aes(x = x, y = y)) +
+  geom_line(data = data.frame(x = seq(min(dens_oob_error$x),max(dens_oob_error$x),length.out=1E3), y = dnorm(x = seq(min(dens_oob_error$x), max(dens_oob_error$x), length.out = 1E3), mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])),
+            mapping = aes(x = x, y = y), colour = "red") + 
+  labs(title = "Real and optimal Guassian PDF") +
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"))
+
+KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+
+ggplot() + geom_line(data = data.frame(x = dens_oob_error$x, y = dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))), 
+                     mapping = aes(x = x, y = y), colour = "blue") + 
+  labs(title = "Derivative of KLD(p||q)", subtitle = sprintf("KLD = %s", formatC(KLD_emp_the, format = "e", digits = 3))) + 
+  theme_bw() + theme(plot.title = element_markdown(hjust=0.5, face="bold", size=16, color = "black"),
+                     plot.subtitle = element_markdown(hjust=0.5, face="bold", size=12, color = "black"))
+
+e.test_irf <- simdata_test$y - (inla_model_2$summary.fixed$mean[1] +
+                                  inla_model_2$summary.fixed$mean[2]*dfsf_sample_weak$X3[idx.test] +
+                                  inla_model_2$summary.random$beta_2$mean[match(X2.group[idx.test], inla_model_2$summary.random$beta_2$ID)] +
+                                  inla_model_2$summary.random$idx_cat$mean[as.numeric(simdata_test$X1)] + 
+                                  drop(fm_basis(x = mesh_inf, loc = coord_weak_test_df) %*% inla_model_2$summary.random$sp$mean) + 
+                                  y_hat)  # Prediction on test data (INLA+RF) 
+```
+
+```{r weak_INLA2_RF2_table, echo=FALSE, warning=FALSE, message=FALSE}
+kable(x = 
+        data.frame(matrix(data = c(sqrt(mean(e.train**2)), sqrt(mean((oob_error)**2)), 
+                                   sqrt(mean(e.test**2)), sqrt(mean(e.test_irf**2))), ncol = 2),
+                   row.names = c("INLA", "INLA-RF")),
+      caption = "RMSE for the train and test datasets. The obtained values are compared by evaluating the data using INLA and using a combination of INLA and RF, where the geometry of the information is not shared between INLA and RF (running only the first loop of the algorithm).",
+      col.names = c("Train", "Test"),
+      row.names = TRUE, digits = 4, format = "html") %>% kable_paper("hover", full_width = FALSE)
+```
+
