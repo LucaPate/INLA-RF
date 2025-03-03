@@ -32,7 +32,7 @@ set.seed(seed = seed)
 # Custom functions ----
 
 ## Loading a cpp custom function to compute the diagonal terms of the product of two  sparse matrices ("dgCMatrix" class)
-Rcpp::sourceCpp("./Code_completed/diagonal_product.cpp")
+Rcpp::sourceCpp("./Scripts/diagonal_product.cpp")
 
 ## Function to fix the precision matrix from inla.call.object$misc$configs$config[[k]]$Q (or Qprior or Qinv)
 fix.Q <- function(Q) {
@@ -60,7 +60,7 @@ diag_Mprod <- function(A,B, num_cores = 1){
 
 # Loading data ----
 
-DF_strong_sim <- readRDS(file = "./Code_completed/Data_strong.RDS")
+DF_strong_sim <- readRDS(file = "./Scripts/Data_strong.RDS")
 
 ## Spliting the data into a train and test set
 
