@@ -187,5 +187,5 @@ gg_y_strong <- ggplot() + # Response variable under weak linearity in the sample
 ggcov2_strong; ggcov3_strong; gg_y_strong
 
 list_spt_sim <- list(spt_sim = spt_sim, mesh = mesh_sim)
-saveRDS(object = dfsf_sample_strong, file = "./Code_completed/Data_strong.RDS")
-saveRDS(object = list_spt_sim, file = "./Code_completed/list_spt_sim.RDS")
+saveRDS(object = dfsf_sample_strong, file = "./Scripts/Data_strong.RDS")
+saveRDS(object = list_spt_sim, file = "./Scripts/list_spt_sim.RDS")
