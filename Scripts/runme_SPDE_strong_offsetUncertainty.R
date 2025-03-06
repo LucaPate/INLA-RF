@@ -81,7 +81,7 @@ mesh_inf <- fm_mesh_2d_inla(boundary = list(st_PR_int_nchull), max.edge = c(0.3,
 
 ## Construction of the SPDE-FEM effect----
 
-max_dist <- lapply(fm_bbox(mesh_inf), "[") %>% unlist(.) %>% matrix(data = ., ncol = 2, byrow = FALSE) %>% dist(.)
+max_dist <- lapply(fm_bbox(mesh_inf), "[") %>% unlist(.) %>% matrix(data = ., ncol = 2, byrow = FALSE) %>% dist(.) %>% max(.)
 spde_spt <- inla.spde2.pcmatern(mesh = mesh_inf, alpha = 2, prior.range = c(max_dist/5, 0.5), prior.sigma = c(1,0.5), constr = TRUE)
 spde_spt_idx <- inla.spde.make.index(name = "spt", n.spde = spde_spt$n.spde, n.group = length(unique(DF_strong_sim$id_time)))
 A_spt_inf <- inla.spde.make.A(mesh = mesh_inf, loc = st_coordinates(DF_strong_sim), group = DF_strong_sim$id_time, n.group = length(unique(DF_strong_sim$id_time)))
