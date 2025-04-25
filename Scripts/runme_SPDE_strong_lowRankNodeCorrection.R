@@ -4,7 +4,7 @@
 # Description: Code combining INLA and RF to perform a low-rank correction of some nodes for a chosen structure of the model.
 #              In this case some nodes of the spatio-temporal structure.
 
-# Last update: 2025-02-26
+# Last update: 2025-04-25
 
 remove(list=ls())
 
@@ -34,7 +34,7 @@ set.seed(seed = seed)
 # Custom functions ----
 
 ## Loading a cpp custom function to compute the diagonal terms of the product of two  sparse matrices ("dgCMatrix" class)
-Rcpp::sourceCpp("./Scripts/diagonal_product.cpp")
+Rcpp::sourceCpp("./Code_completed/diagonal_product.cpp")
 
 ## Function to fix the precision matrix from inla.call.object$misc$configs$config[[k]]$Q (or Qprior or Qinv)
 fix.Q <- function(Q) {
@@ -63,8 +63,8 @@ diag_Mprod <- function(A,B, num_cores = 1){
 
 # Loading data ----
 
-DF_strong_sim <- readRDS(file = "./Scripts/Data_strong.RDS")
-list_spt_sim <- readRDS(file = "./Scripts/list_spt_sim.RDS")
+DF_strong_sim <- readRDS(file = "./Code_completed/Data_strong.RDS")
+list_spt_sim <- readRDS(file = "./Code_completed/list_spt_sim.RDS")
 
 ## Spliting the data into a train and test set
 
@@ -85,7 +85,7 @@ mesh_inf <- fm_mesh_2d_inla(boundary = list(st_PR_int_nchull), max.edge = c(0.3,
 
 ## Construction of the SPDE-FEM effect----
 
-max_dist <- lapply(fm_bbox(mesh_inf), "[") %>% unlist(.) %>% matrix(data = ., ncol = 2, byrow = FALSE) %>% dist(.) %>% max(.)
+max_dist <- lapply(fm_bbox(mesh_inf), "[") %>% unlist(.) %>% matrix(data = ., ncol = 2, byrow = FALSE) %>% dist(.)
 spde_spt <- inla.spde2.pcmatern(mesh = mesh_inf, alpha = 2, prior.range = c(max_dist/5, 0.5), prior.sigma = c(1,0.5), constr = TRUE)
 spde_spt_idx <- inla.spde.make.index(name = "spt", n.spde = spde_spt$n.spde, n.group = length(unique(DF_strong_sim$id_time)))
 A_spt_inf <- inla.spde.make.A(mesh = mesh_inf, loc = st_coordinates(DF_strong_sim), group = DF_strong_sim$id_time, n.group = length(unique(DF_strong_sim$id_time)))
@@ -141,12 +141,11 @@ idx_linked_spt <- order(rinla$summary.random$spt$sd[idx_linked], decreasing = TR
 selected_spt_nodes <- rinla$summary.random$spt[idx_linked[idx_linked_spt],]
 idx_obs.linked <- which(apply(X = A_spt_inf[idx_train,selected_spt_nodes$ID+1], MARGIN = 1, FUN = sum) != 0)
 
-
 selected_mesh_nodes <- (selected_spt_nodes$ID + 1) %% mesh_inf$n
 group_mesh <- ceiling((selected_spt_nodes$ID + 1) / mesh_inf$n)
 if(any(selected_mesh_nodes == 0)){selected_mesh_nodes[selected_mesh_nodes==0] <- mesh_inf$n}
 
-sim_node_values <- mclapply(X = unique(group_mesh), mc.cores = 10, FUN = function(i){
+sim_node_values <- mclapply(X = unique(group_mesh), mc.cores = 1, FUN = function(i){
   res <- fm_basis(x = list_spt_sim$mesh, loc = mesh_inf$loc[selected_mesh_nodes[group_mesh == i],1:2]) %*% list_spt_sim$spt_sim[((i-1)*list_spt_sim$mesh$n+1):(i*list_spt_sim$mesh$n)] %>% drop(.)
   return(res)
 }) %>% do.call(what = c, .)
@@ -232,18 +231,20 @@ while(KLD_GMRF_den > 1E-2){ # Using the KLD as condition
     Q_old <- Q_new
     
     if(i == 1){
+      offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] <- offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] + y.e_hat_spt
+      
       tau.iid <- as.numeric(fit_rf_e$prediction.error)**(-1)
       # mnpred = sum(dim(inf_stk$A)) = size(y_obs) + size(letent_field), without any reduction.
       list_control_mode <- list(x = c(rep(0, rinla$misc$configs$mpred + dim(inf_stk_loop$A)[2]), rinla$misc$configs$config[[1]]$improved.mean[1:(length(rinla$misc$configs$config[[1]]$improved.mean)-nrow(rinla$summary.fixed))], rep(0, times = nstress), rev(length(rinla$misc$configs$config[[1]]$improved.mean) - 0:(nrow(rinla$summary.fixed)-1))), 
                                 theta = rinla$mode$theta, restart = TRUE, fixed = FALSE)
     } else{
+      offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] <- offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] + rinla$summary.random$u.iid$mean + y.e_hat_spt
       tau.iid <- as.numeric(fit_rf_e$prediction.error)**(-1)
       # mnpred = sum(dim(inf_stk$A)) = size(y_obs) + size(letent_field)
       list_control_mode <- list(x = c(rep(0, sum(dim(inf_stk_loop$A))), rinla$misc$configs$config[[1]]$improved.mean),
                                 theta = rinla$mode$theta, restart = TRUE, fixed = FALSE)
     }
     
-    offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] <- y.e_hat_spt
     
     # offx[idx_train] <- offx[idx_train] + y.e_hat[idx_train]
     rinla <- inla(data = inla.stack.data(stack = inf_stk_loop), 
@@ -287,25 +288,24 @@ while(KLD_GMRF_den > 1E-2){ # Using the KLD as condition
   df_e <- data.frame(e = e, id_time = DF_strong_sim$id_time, X1 = DF_strong_sim$X1, X2 = DF_strong_sim$X2, X3 = DF_strong_sim$X3, sp_x = sp_coord[,1], sp_y = sp_coord[,2])
   
   fit_rf_e <- 
-    ranger(formula = e ~ id_time + sp_x + sp_y,
+    ranger(formula = e ~ id_time + sp_x + sp_y, # id_time + sp_x + sp_y,
            data = df_e[idx_train,],
            importance = "none",
            replace = FALSE,
            seed = seed,
            oob.error = TRUE)
   
-  y_hat_pred <- predict(fit_rf_e, data = data.frame(df_e[idx_test,]))$predictions
+  y.e_hat_spt <- predict(fit_rf_e, data = data.frame(sp_x = mesh_inf$loc[selected_mesh_nodes,1], sp_y = mesh_inf$loc[selected_mesh_nodes,2], id_time = group_mesh))$predictions
   
-  idx_nnodes.obs <- mclapply(X = seq_len(nrow(A_u.iid)), mc.cores = 10, FUN = function(i){sum(A_u.iid[i,] != 0)}) %>% do.call(what = c, .)
-  
-  y.e_hat[idx_train] <- fit_rf_e$predictions
+  # idx_nnodes.obs <- mclapply(X = seq_len(nrow(A_u.iid)), mc.cores = 10, FUN = function(i){sum(A_u.iid[i,] != 0)}) %>% do.call(what = c, .)
+  # y.e_hat[idx_train] <- fit_rf_e$predictions
   # ei_hat.u <- y.e_hat[A_u.iid@i+1]*A_u.iid@x/idx_nnodes.obs[A_u.iid@i+1]
-  ei_hat.u <- y.e_hat[A_u.iid@i+1]/idx_nnodes.obs[A_u.iid@i+1]
+  # ei_hat.u <- y.e_hat[A_u.iid@i+1]/idx_nnodes.obs[A_u.iid@i+1]
   
-  y.e_hat_spt <- mclapply(X = seq_len(nstress), mc.cores = 10, FUN = function(i){mean(ei_hat.u[(A_u.iid@j+1)==i])}) %>% do.call(what = c, .)
+  # y.e_hat_spt <- mclapply(X = seq_len(nstress), mc.cores = 10, FUN = function(i){mean(ei_hat.u[(A_u.iid@j+1)==i])}) %>% do.call(what = c, .)
   
   i = i + 1 # Increasing in 1 the value of the index for the loop
-  DFrmse_train[i,] <- c(sqrt(mean((ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"])**2)), sqrt(mean((ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"] - y.e_hat[idx_train])**2)))
+  # DFrmse_train[i,] <- c(sqrt(mean((ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"])**2)), sqrt(mean((ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"] - y.e_hat[idx_train])**2)))
 
   if(verbose && i > 1){
     sprintf("KLD: %.4f. \n", KLD_GMRF_den) %>% cat(.)
@@ -318,12 +318,15 @@ difftime(t2, t1)
 
 # Graphical results for the node correction ----
 
-selected_spt_nodes$ID+1
-corr_mean <- offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] + rinla$summary.random$u.iid$mean
+# selected_spt_nodes$ID+1
+# corr_mean <- rinla$summary.random$u.iid$mean
+# idx_linked[idx_linked_spt]
 
-marginals_spt_rf <- mclapply(X = selected_spt_nodes$ID+1, mc.cores = 20, FUN = function(i){
-  inla.tmarginal(marginal = rinla$marginals.random$spt[[i]], fun = function(x){(x - rinla$summary.random$spt$mean[i])*tau.iid**(-1/2) + corr_mean[which((selected_spt_nodes$ID+1)==i)]})
+marginals_spt_rf <- mclapply(X = selected_spt_nodes$ID+1, mc.cores = 1, FUN = function(i){
+  inla.tmarginal(marginal = rinla$marginals.random$spt[[i]], fun = function(x){((x - rinla$summary.random$spt$mean[i])/rinla$summary.random$spt$sd[i])*sqrt(rinla$summary.random$spt$sd[i]**2 + rinla$summary.random$spt$mean[i] + rinla$summary.random$u.iid$sd[which((selected_spt_nodes$ID+1)==i)]**2) + rinla$summary.random$u.iid$mean[which((selected_spt_nodes$ID+1)==i)]})
 })
+
+marginals_spt_rf <- rinla$marginals.random$u.iid$
 
 n_group <- 10
 nodes_sel_marg_rf <- mclapply(X = 1:nstress, mc.cores = 1, FUN = function(i){cbind(data.frame(marginals_spt_rf[[i]]), group = i%%n_group + if(i%%n_group==0){n_group}else{0}, height = 0, ID_group = ceiling(i/n_group))}) %>% 
