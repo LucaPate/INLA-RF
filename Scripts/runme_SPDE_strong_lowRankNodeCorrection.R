@@ -318,15 +318,9 @@ difftime(t2, t1)
 
 # Graphical results for the node correction ----
 
-# selected_spt_nodes$ID+1
-# corr_mean <- rinla$summary.random$u.iid$mean
-# idx_linked[idx_linked_spt]
-
 marginals_spt_rf <- mclapply(X = selected_spt_nodes$ID+1, mc.cores = 1, FUN = function(i){
   inla.tmarginal(marginal = rinla$marginals.random$spt[[i]], fun = function(x){((x - rinla$summary.random$spt$mean[i])/rinla$summary.random$spt$sd[i])*sqrt(rinla$summary.random$spt$sd[i]**2 + rinla$summary.random$spt$mean[i] + rinla$summary.random$u.iid$sd[which((selected_spt_nodes$ID+1)==i)]**2) + rinla$summary.random$u.iid$mean[which((selected_spt_nodes$ID+1)==i)]})
 })
-
-marginals_spt_rf <- rinla$marginals.random$u.iid$
 
 n_group <- 10
 nodes_sel_marg_rf <- mclapply(X = 1:nstress, mc.cores = 1, FUN = function(i){cbind(data.frame(marginals_spt_rf[[i]]), group = i%%n_group + if(i%%n_group==0){n_group}else{0}, height = 0, ID_group = ceiling(i/n_group))}) %>% 
