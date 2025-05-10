@@ -4,7 +4,8 @@
 # In this case, there are only some points that are corrected by the RF in the INLA latent field, those points 
 # are called stress points. This avoids an overfitting from correcting the whole data.
 
-# Last update: 9/12/2024
+# Date (Creation): 9/12/2024
+# Last update: 10/0.5/2025
 
 remove(list=ls())
 
@@ -15,6 +16,7 @@ library(ranger)
 library(ggplot2)
 library(ggtext)
 library(gridExtra)
+library(ggmagnify)
 
 library(dplyr)
 
@@ -35,6 +37,11 @@ u.rw1 %>% plot(., type = "l")
 ysim <- rnorm(n = nsize, mean = u.rw1 + 2, sd = (prec.gauss)**(-1/2))
 ysim %>% plot(., type = "l")
 
+ggplot() + 
+  geom_line(data = data.frame(Time = seq_along(ysim), y = ysim), mapping = aes(x = Time, y = y)) +
+  theme_bw() + theme(axis.title.x = element_text(size = 18), axis.title.y = element_text(size = 18), 
+                     axis.text = element_text(size = 14))
+
 rinla <- inla(data = list(y = ysim, beta0 = rep(1, nsize), u = 1:nsize), 
               family = "gaussian",
               formula = y ~ -1 + beta0 + f(u, model = "rw2", constr = TRUE),
@@ -43,43 +50,71 @@ rinla <- inla(data = list(y = ysim, beta0 = rep(1, nsize), u = 1:nsize),
 rinla_orig <- rinla # saving the first analysis
 
 ggrw1 <- ggplot() +
-  geom_ribbon(data = data.frame(rinla$summary.random$u, id = "Temporal Effect") %>%
+  geom_ribbon(data = data.frame(rinla_orig$summary.random$u, id = "Temporal Effect") %>%
                 rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
               mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
-  geom_line(data = data.frame(rinla$summary.random$u, id = "Temporal Effect"),
+  geom_line(data = data.frame(rinla_orig$summary.random$u, id = "Temporal Effect"),
             mapping = aes(x = ID, y = mean), color = "blue") +
-  geom_line(data = data.frame(ID = rinla$summary.random$u$ID, mean = u.rw1, id = "Temporal Effect"),
+  geom_line(data = data.frame(ID = rinla_orig$summary.random$u$ID, mean = u.rw1, id = "Temporal Effect"),
             mapping = aes(x = ID, y = mean), color = "black") +
   geom_vline(xintercept = loc.stress, color = "red") +
-  theme_bw() + labs(title = "RW1 effect (marginals).")
+  theme_bw() + labs(title = "A. Temporal effect (marginals)") +
+  theme(plot.title = element_text(size = 20, h = 0, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14))
 
 ggvar <- ggplot() +
-  geom_point(data = rinla$summary.random$u, mapping = aes(x = ID, y = sd**2), color = "blue") +
+  geom_point(data = rinla_orig$summary.random$u, mapping = aes(x = ID, y = sd**2), color = "blue") +
   geom_vline(xintercept = loc.stress, color = "red") + 
-  labs(title = "Latent-field. Stress points (variance)") +
-  theme_bw()
+  labs(title = "B. Latent-field (variance)") +
+  theme_bw() + ylab(label = expression(sigma^2~(u[i]))) +
+  theme(plot.title = element_text(size = 20, h = 0, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14))
 
 gglp_var <- ggplot() +
-  geom_point(data = data.frame(ID = 1:nrow(rinla$summary.fitted.values), rinla$summary.fitted.values), mapping = aes(x = ID, y = sd**2), color = "blue") +
+  geom_point(data = data.frame(ID = 1:nrow(rinla_orig$summary.fitted.values), rinla_orig$summary.fitted.values), mapping = aes(x = ID, y = sd**2), color = "blue") +
   geom_vline(xintercept = loc.stress, color = "red") + 
-  labs(title = "Linear Predictor. Stress points (variance)") +
-  theme_bw()
+  labs(title = "C. Linear predictor (variance)") +
+  theme_bw() + ylab(label = expression(sigma^2~(eta[i]))) +
+  theme(plot.title = element_text(size = 20, h = 0, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14))
 
 grid.arrange(arrangeGrob(grobs = list(ggrw1, ggvar, gglp_var), ncol = 1))
 
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+colors_base <- gg_color_hue(2)
+
 nstress <- 1E2
-sel_stressp <- (rinla$summary.random$u$sd**2) %>% order(., decreasing = TRUE) %>% .[1:nstress]
+sel_stressp <- (rinla_orig$summary.random$u$sd**2) %>% order(., decreasing = TRUE) %>% .[1:nstress]
 stress_col <- rep("blue", times = nsize); stress_col[sel_stressp] <- "red"
 ggplot() +
-  geom_ribbon(data = data.frame(ID = 1:nsize, rinla$summary.random$u, id = "Temporal Effect") %>%
+  geom_ribbon(data = data.frame(ID = 1:nsize, rinla_orig$summary.random$u, id = "Temporal Effect") %>%
                 rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
               mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
-  geom_line(data = data.frame(ID = 1:nsize, rinla$summary.random$u, id = "Temporal Effect"),
+  geom_line(data = data.frame(ID = 1:nsize, rinla_orig$summary.random$u, id = "Temporal Effect"),
             mapping = aes(x = ID, y = mean), color = "blue") +
   geom_line(data = data.frame(ID = 1:nsize, mean = u.rw1, id = "Temporal Effect"),
             mapping = aes(x = ID, y = mean), color = "black") +
-  geom_point(data = data.frame(ID = 1:nsize, mean = u.rw1), mapping = aes(x = ID, y = mean, colour = stress_col)) +
-  theme_bw() + labs(title = "Latent Field (INLA).")
+  geom_point(data = data.frame(ID = 1:nsize, mean = u.rw1), mapping = aes(x = ID, y = mean, colour = stress_col), size = 2) +
+  theme_bw() + labs(title = "Temporal effect nodes") +
+  labs(colour = "Stress points") +
+  scale_color_manual(labels = c("Not stressed", "Stressed"),
+                     values = colors_base) +
+  theme(plot.title = element_text(size = 20, h = 0.5, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14), 
+        legend.title = element_text(size = 18, face = "bold"),
+        legend.text = element_text(size = 16))
 
 # Setting the configuration for the Algorithm ----
 
@@ -221,7 +256,7 @@ gg_lpred_INLA <- ggplot() + # ILA without RF corrections
   theme_bw() + theme(plot.title = element_text(face = "bold", h = 0.5))
 
 
-gg_lpred_INLA.RF <- ggplot() + # ILA without RF corrections 
+gg_lpred_INLA.RF <- ggplot() + # INLA without RF corrections 
   geom_ribbon(data = data.frame(ID = 1:nsize, rinla$summary.fitted.values[1:length(ysim),], id = "Temporal Effect") %>%
                 rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
               mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
@@ -263,7 +298,7 @@ rw1_corr$sd[sel_stressp[order(sel_stressp)]] <- rinla_u.rw1_sel$sd
 rw1_corr[,"0.025quant"] <- qnorm(p = 0.025, mean = rw1_corr$mean, sd = rw1_corr$sd)
 rw1_corr[,"0.975quant"] <- qnorm(p = 0.975, mean = rw1_corr$mean, sd = rw1_corr$sd)
 
-gg_rw_INLA <- ggplot() +
+gg_rw_INLA <- ggplot(rw1_corr, mapping = aes(ID, mean)) +
   geom_ribbon(data = rinla_orig$summary.random$u %>% data.frame(., id = "Original") %>%
                 rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
               mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
@@ -280,8 +315,23 @@ gg_rw_INLA <- ggplot() +
             mapping = aes(x = ID, y = mean), color = "black") +
   geom_vline(xintercept = sel_stressp[order(sel_stressp)], colour = "salmon", alpha = 0.1) +
   facet_wrap(facets = ~ id, ncol = 1) +
-  labs(title = "Latent field (INLA and INLA-RF)") +
-  theme_bw() + theme(plot.title = element_text(face = "bold", h = 0.5))
+  labs(title = "Latent field (orginal and corrected by RF)") +
+  theme_bw() + # theme(plot.title = element_text(face = "bold", h = 0.5)) +
+  theme(plot.title = element_text(size = 20, h = 0.5, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14), 
+        legend.title = element_text(size = 18, face = "bold"),
+        legend.text = element_text(size = 16))
+
+gg_rw_INLA_mag <- gg_rw_INLA + 
+  geom_magnify(aes(from = ID > 352 & ID < 373), to = c(150, 310, -1, 9)) +
+  geom_magnify(aes(from = ID > 534 & ID < 554), to = c(390, 540, 2, 13)) +
+  geom_magnify(aes(from = ID > 895 & ID < 920), to = c(730, 870, -2, 9)) +
+  geom_magnify(aes(from = ID > 1073 & ID < 1094), to = c(940, 1070, 5, 16)) +
+  geom_magnify(aes(from = ID > 1436 & ID < 1456), to = c(1300, 1410, 5, 16)) +
+  geom_magnify(aes(from = ID > 1620 & ID < 1637), to = c(1650, 1800, -2, 9))
+  
 
 gg_rw_origcor_INLA <- ggplot() +
   geom_point(data = rinla_orig$summary.random$u[1:length(ysim),][sel_stressp[order(sel_stressp)],], mapping = aes(x = 1:length(sel_stressp)-0.25, y = mean)) +
@@ -289,7 +339,14 @@ gg_rw_origcor_INLA <- ggplot() +
   geom_point(data = rinla_u.rw1_sel, mapping = aes(x = 1:length(sel_stressp) + 0.25, y = mean), colour = "red") +
   geom_errorbar(data = rinla_u.rw1_sel, aes(x = 1:length(sel_stressp) + 0.25, ymin=mean-sd, ymax=mean+sd), width=.2, position = position_dodge(0.05), colour = "red") +
   geom_segment(data.frame(xi = 1:length(sel_stressp)-0.5, xe = 1:length(sel_stressp)+0.5, y = u.rw1[sel_stressp[order(sel_stressp)]]), mapping = aes(x = xi, xend = xe, y = y), lty = "solid", linewidth = 1, colour = "blue", alpha = 0.75) +
-  labs(title = "Latent Field Stress points (original vs corrected by RF)") + xlab(label = "ID") +
-  theme_bw() + theme(plot.title = element_text(face = "bold", h = 0.5))
+  labs(title = "Latent field stress points (original vs corrected by RF)") + xlab(label = "ID") +
+  theme_bw() + # theme(plot.title = element_text(face = "bold", h = 0.5))
+  theme(plot.title = element_text(size = 20, h = 0.5, face = "bold"),
+        axis.title.x = element_blank(), # element_text(size = 18), 
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14), 
+        legend.title = element_text(size = 18, face = "bold"),
+        legend.text = element_text(size = 16))
 
 grid.arrange(arrangeGrob(grobs = list(gg_rw_INLA, gg_rw_origcor_INLA), ncol = 2))
