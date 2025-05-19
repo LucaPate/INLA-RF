@@ -330,7 +330,7 @@ gg_rw_INLA_mag <- gg_rw_INLA +
   geom_magnify(aes(from = ID > 895 & ID < 920), to = c(730, 870, -2, 9)) +
   geom_magnify(aes(from = ID > 1073 & ID < 1094), to = c(940, 1070, 5, 16)) +
   geom_magnify(aes(from = ID > 1436 & ID < 1456), to = c(1300, 1410, 5, 16)) +
-  geom_magnify(aes(from = ID > 1620 & ID < 1637), to = c(1650, 1800, -2, 9))
+  geom_magnify(aes(from = ID > 1620 & ID < 1637), to = c(1650, 1800, -2, 9)) + theme_void()
   
 
 gg_rw_origcor_INLA <- ggplot() +
