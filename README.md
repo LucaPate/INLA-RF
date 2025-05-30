@@ -7,7 +7,8 @@
 1. [runme_SPDE_strong_datasim.R](./Scripts/runme_SPDE_strong_datasim.R): Simulation of the data for the *strong non-linearity* scenario.
 2. [runme_SPDE_strong_offset.R](./Scripts/runme_SPDE_strong_offset.R): Script implementing the INLA-RF algorithm to analyze the simulated data, correcting only the mean.
 3. [runme_SPDE_strong_offsetUncertainty.R](./Scripts/runme_SPDE_strong_offsetUncertainty.R): Script implementing the INLA-RF algorithm to analyze the simulated data, correcting the mean and transfering the uncertainty between the steps of the algorithm.
-4. [runme_SPDE_strong_lowRankNodeCorrection.R](./Scripts/runme_SPDE_strong_lowRankNodeCorrection.R): Script implementing the INLA-RF algorithm to analyze the simulated data, correcting only some pre-specified nodes of the spatio-temporal structure of the model.
+4. [runme_SPDE_strong_Offset_and_OffsetUncertainty_CV.R](./Scripts/runme_SPDE_strong_Offset_and_OffsetUncertainty_CV.R): Script implementing the INLA-RF algorithm to perform the cross-validation analysis of the simulated data, correcting the mean with and without uncertainty propagation..
+5. [runme_SPDE_strong_lowRankNodeCorrection.R](./Scripts/runme_SPDE_strong_lowRankNodeCorrection.R): Script implementing the INLA-RF algorithm to analyze the simulated data, correcting only some pre-specified nodes of the spatio-temporal structure of the model. 
 
 ### Other examples implementing the INLA-RF algorithm 
 
