@@ -1,4 +1,4 @@
-# SPDE-Forest
+# SPDE-RF
 
 ## Scripts
 
