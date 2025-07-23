@@ -12,3 +12,7 @@
 ### Simulation study 2 (purely temporal scenario)
 
 1. [runme_temporal_INLARF2.R](./Scripts/runme_temporal_INLARF2.R): Script implementing the data simulation and the INLA-RF2 algorithm to analyze the simulated data, correcting only some pre-specified nodes of the spatio-temporal structure of the model.
+
+### Extra
+
+1. [diagonal_product.cpp](./Scripts/diagonal_product.cpp): Script defining a function to compute only the diagonal elements of a product of two square sparse matrtices in CSC format (for KLD computation).
