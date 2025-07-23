@@ -1,4 +1,4 @@
-# SPDE-RF
+# INLA-RF
 
 ## Scripts
 
