@@ -10,4 +10,5 @@
 4. [runme_spatiotemporal_INLARF11_and_INLARF12_CV.R](./Scripts/runme_spatiotemporal_INLARF11_and_INLARF12_CV.R): Script implementing the INLA-RF algorithms (1.1 and 1.2) to perform the cross-validation analysis of the simulated data, correcting the mean without and with uncertainty propagation.
 
 ### Simulation study 2 (purely temporal scenario)
-1. [runme_temporal_INLARF2.R](./Scripts/runme_temporal_INLARF2.R): Script implementing the INLA-RF2 algorithm to analyze the simulated data, correcting only some pre-specified nodes of the spatio-temporal structure of the model.
+
+1. [runme_temporal_INLARF2.R](./Scripts/runme_temporal_INLARF2.R): Script implementing the data simulation and the INLA-RF2 algorithm to analyze the simulated data, correcting only some pre-specified nodes of the spatio-temporal structure of the model.
