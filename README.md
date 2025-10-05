@@ -15,4 +15,4 @@
 
 ### Extra
 
-1. [diagonal_product.cpp](./Scripts/diagonal_product.cpp): Script defining a function to compute only the diagonal elements of a product of two square sparse matrtices in CSC format (for KLD computation).
+1. [diagonal_product.cpp](./Scripts/diagonal_product.cpp): Script defining a function to compute only the diagonal elements of a product of two square sparse matrices in CSC format (for KLD computation).
