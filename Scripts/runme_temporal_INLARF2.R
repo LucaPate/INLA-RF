@@ -1,10 +1,12 @@
-# Title: runme_SPDE_strong_lowRankNodeCorrection.R
+# Title: runme_temporal_INLARF2.R
 # Author: Mario Figueira
-# Date: 2025-02-22
-# Description: Code combining INLA and RF to perform a low-rank correction of some nodes for a chosen structure of the model.
-#              In this case some nodes of the spatio-temporal structure.
+# Date: 2024-12-09
+# Description: Combining INLA and RF for correcting the predictions. The correction from the random forest is 
+#              integrated as an offset, transferring the uncertainty from the RF to the correction in INLA. 
+#              In this case, there are only some points that are corrected by the RF in the INLA latent field, those points 
+#              are called stress points. This avoids an overfitting from correcting the whole data.
 
-# Last update: 2025-04-25
+# Last update: 2025-05-10
 
 remove(list=ls())
 
@@ -31,283 +33,247 @@ library(ranger)
 seed <- 1234 # set a seed for reproducibility
 set.seed(seed = seed)
 
-# Custom functions ----
+nsize <- 2E3
+prec.rw1 <- prec.gauss <- 20
 
-## Loading a cpp custom function to compute the diagonal terms of the product of two  sparse matrices ("dgCMatrix" class)
-Rcpp::sourceCpp("./Code_completed/diagonal_product.cpp")
+n.strsp <- 10 # number of stress points
+loc.stress <- 1:n.strsp * floor(nsize/(n.strsp + 1)) # location of the stress points 
+vec.strsp <- rep(0, times = nsize)
+vec.strsp[loc.stress] <- sign(rbinom(n = n.strsp, size = 1, prob = 0.5) - 0.5) * rnorm(n = n.strsp, mean = 5, sd = 0.1)
 
-## Function to fix the precision matrix from inla.call.object$misc$configs$config[[k]]$Q (or Qprior or Qinv)
-fix.Q <- function(Q) {
-  # Q: the precision matrix from the inla.call.object; inla.call.object <- inla(...) 
-  d <- diag(Q)
-  Q <- Q + t(Q)
-  diag(Q) <- d
-  return (Q)
-}
+u.rw1 <- cumsum(rnorm(nsize, mean = 0, sd = (prec.rw1)**(-1/2)) + vec.strsp); u.rw1 <- u.rw1 - mean(u.rw1)
+u.rw1 %>% plot(., type = "l")
 
-# A function to compute only the diagonal elements of a product of two matrices (A and B) using parallelized code in R (it is better to use the C++ function)
-diag_Mprod <- function(A,B, num_cores = 1){
-  # A: a dense matrix
-  # B: a sparse matrix in Compressed Sparse Column (CSC) Format
-  if(class(B)=="dgCMatrix"){
-    res <- parallel::mclapply(X = seq_len(B@Dim[1]), mc.cores = num_cores, FUN = function(i){
-      idx_x <- ((B@p[i]+1):B@p[i+1])
-      idx_r <- B@i[idx_x]+1
-      return(sum(A[i,idx_r]*B@x[idx_x]))
-    }) %>% do.call(what = c, .)
-  } else{
-    stop("B is not 'dgCMatrix' class.")
-  }
-  return(res)
-}
+ysim <- rnorm(n = nsize, mean = u.rw1 + 2, sd = (prec.gauss)**(-1/2))
+ysim %>% plot(., type = "l")
 
-# Loading data ----
+ggplot() + 
+  geom_line(data = data.frame(Time = seq_along(ysim), y = ysim), mapping = aes(x = Time, y = y)) +
+  geom_vline(xintercept = loc.stress, color = "red") +
+  theme_bw() + theme(axis.title.x = element_text(size = 18), axis.title.y = element_text(size = 18), 
+                     axis.text = element_text(size = 14))
 
-DF_strong_sim <- readRDS(file = "./Code_completed/Data_strong.RDS")
-list_spt_sim <- readRDS(file = "./Code_completed/list_spt_sim.RDS")
-
-## Spliting the data into a train and test set
-
-idx_train <- sample(x = seq_len(nrow(DF_strong_sim)), size = nrow(DF_strong_sim)*0.8) %>% sort(.)
-idx_test <- setdiff(seq_len(nrow(DF_strong_sim)), idx_train)
-DF_train <- DF_strong_sim; DF_train[idx_test,"y"] <- NA
-DF_test <- DF_strong_sim; DF_test[idx_train,"y"] <- NA
-
-# Analysing strong data ----
-
-## Building the spatial mesh for SPDE-FEM inference ----
-data(PRborder)
-sf_PRborder <- st_sfc(st_polygon(x = list(PRborder))) # boundary of the sr (study region)
-PR_nchull <- fm_nonconvex_hull_inla(x =  sf_PRborder, convex = -0.05)
-st_PR_int_nchull <-  st_polygon(x = list(PR_nchull$loc[c(PR_nchull$idx[1:which(PR_nchull$idx[1,1]==PR_nchull$idx[,2]),1],1),1:2]))
-
-mesh_inf <- fm_mesh_2d_inla(boundary = list(st_PR_int_nchull), max.edge = c(0.3,0.6), offset = c(-0.01,-0.1))
-
-## Construction of the SPDE-FEM effect----
-
-max_dist <- lapply(fm_bbox(mesh_inf), "[") %>% unlist(.) %>% matrix(data = ., ncol = 2, byrow = FALSE) %>% dist(.)
-spde_spt <- inla.spde2.pcmatern(mesh = mesh_inf, alpha = 2, prior.range = c(max_dist/5, 0.5), prior.sigma = c(1,0.5), constr = TRUE)
-spde_spt_idx <- inla.spde.make.index(name = "spt", n.spde = spde_spt$n.spde, n.group = length(unique(DF_strong_sim$id_time)))
-A_spt_inf <- inla.spde.make.A(mesh = mesh_inf, loc = st_coordinates(DF_strong_sim), group = DF_strong_sim$id_time, n.group = length(unique(DF_strong_sim$id_time)))
-
-x2_group <- inla.group(x = DF_strong_sim$X2, n = 50)
-x3_group <- inla.group(x = DF_strong_sim$X3, n = 50)
-
-# We can analyse the covariates as fixed effects or as random effects, using a "non-linear" structure as a Random Walk of second order.
-inf_stk <- inla.stack(data = list(y = DF_train$y),
-                      A = list(1, A_spt_inf),
-                      effects = list(
-                        list(beta0 = rep(1, nrow(DF_train)),
-                             f_x1 = as.numeric(DF_train$X1),
-                             # f_x2 = x2_group,
-                             # f_x3 = x3_group,
-                             f_x2 = DF_strong_sim$X2,
-                             f_x3 = DF_strong_sim$X3
-                        ),
-                        spde_spt_idx
-                      ),
-                      remove.unused = FALSE,
-                      compress = FALSE,
-                      tag = "inf_stk")
-
-spt_formula <- y ~ -1 + beta0 + f(f_x1, model = "iid", constr = TRUE) + 
-  f_x2 + f_x3 +
-  # f(f_x2, model = "rw2", constr = TRUE) + f(f_x3, model = "rw2", constr = TRUE) +
-  f(spt, model = spde_spt, group = spt.group, control.group = list(model = "ar1"))
-
-rinla <- inla(data = inla.stack.data(stack = inf_stk),
+rinla <- inla(data = list(y = ysim, beta0 = rep(1, nsize), u = 1:nsize), 
               family = "gaussian",
-              formula = spt_formula,
-              control.predictor = list(A = inla.stack.A(inf_stk)),
+              formula = y ~ -1 + beta0 + f(u, model = "rw2", constr = TRUE),
               control.compute = list(config = TRUE),
-              num.threads = 48,
               verbose = FALSE)
-
 rinla_orig <- rinla # saving the first analysis
-mu_new <- rinla$misc$configs$config[[1]]$improved.mean
-Q_new <- fix.Q(rinla$misc$configs$config[[1]]$Q)
 
-# Nodes to be corrected and true values ----
+ggrw1 <- ggplot() +
+  geom_ribbon(data = data.frame(rinla_orig$summary.random$u, id = "Temporal Effect") %>%
+                rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
+  geom_line(data = data.frame(rinla_orig$summary.random$u, id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "blue") +
+  geom_line(data = data.frame(ID = rinla_orig$summary.random$u$ID, mean = u.rw1, id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "black") +
+  geom_vline(xintercept = loc.stress, color = "red") +
+  theme_bw() + labs(title = "A. Temporal effect (marginals)") +
+  theme(plot.title = element_text(size = 20, h = 0, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14))
 
-nstress <- 100 # The number of stress nodes to correct. Here we will corect only nodes related to the spatio-temporal effect
-idx_linked <- which(apply(X = A_spt_inf[idx_train,], MARGIN = 2, FUN = sum) != 0)
+ggvar <- ggplot() +
+  geom_point(data = rinla_orig$summary.random$u, mapping = aes(x = ID, y = sd**2), color = "blue") +
+  geom_vline(xintercept = loc.stress, color = "red") + 
+  labs(title = "B. Latent-field (variance)") +
+  theme_bw() + ylab(label = expression(sigma^2~(u[i]))) +
+  theme(plot.title = element_text(size = 20, h = 0, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14))
 
-## Choosing the nodes to correct ----
-# Choosing the nodes to correct by higher variance or related to higher RMSE its different when we have a projection from the latent field to the linear predictor.
-# Given that the RMSE is computed for the observations, which implies that it is related to (\eta) and not directly linked to the latent field (x). 
-# Meanwhile, variance is linked directly to the latent field nodes.
+gglp_var <- ggplot() +
+  geom_point(data = data.frame(ID = 1:nrow(rinla_orig$summary.fitted.values), rinla_orig$summary.fitted.values), mapping = aes(x = ID, y = sd**2), color = "blue") +
+  geom_vline(xintercept = loc.stress, color = "red") + 
+  labs(title = "C. Linear predictor (variance)") +
+  theme_bw() + ylab(label = expression(sigma^2~(eta[i]))) +
+  theme(plot.title = element_text(size = 20, h = 0, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14))
 
-idx_linked_spt <- order(rinla$summary.random$spt$sd[idx_linked], decreasing = TRUE)[1:nstress]
-selected_spt_nodes <- rinla$summary.random$spt[idx_linked[idx_linked_spt],]
-idx_obs.linked <- which(apply(X = A_spt_inf[idx_train,selected_spt_nodes$ID+1], MARGIN = 1, FUN = sum) != 0)
+grid.arrange(arrangeGrob(grobs = list(ggrw1, ggvar, gglp_var), ncol = 1))
 
-selected_mesh_nodes <- (selected_spt_nodes$ID + 1) %% mesh_inf$n
-group_mesh <- ceiling((selected_spt_nodes$ID + 1) / mesh_inf$n)
-if(any(selected_mesh_nodes == 0)){selected_mesh_nodes[selected_mesh_nodes==0] <- mesh_inf$n}
-
-sim_node_values <- mclapply(X = unique(group_mesh), mc.cores = 1, FUN = function(i){
-  res <- fm_basis(x = list_spt_sim$mesh, loc = mesh_inf$loc[selected_mesh_nodes[group_mesh == i],1:2]) %*% list_spt_sim$spt_sim[((i-1)*list_spt_sim$mesh$n+1):(i*list_spt_sim$mesh$n)] %>% drop(.)
-  return(res)
-}) %>% do.call(what = c, .)
-
-n_group <- 10
-nodes_sel_marg <- mclapply(X = 1:nstress, mc.cores = 1, FUN = function(i){cbind(data.frame(rinla$marginals.random$spt[[selected_spt_nodes$ID[i]+1]]), group = i%%n_group + if(i%%n_group==0){n_group}else{0}, height = 0, ID_group = ceiling(i/n_group))}) %>% 
-  do.call(what = rbind, .)
-
-ngroup_idx_to_plot <- 1:10
-height_error_bar <- 1:n_group
-scale_ridge <- 1
-ggplot_post.correction <- ggplot() +
-  geom_ridgeline_gradient(data = nodes_sel_marg[nodes_sel_marg$ID_group %in% ngroup_idx_to_plot,], mapping = aes(x = x, y = height + group, group = group, height = y, scale = scale_ridge, fill = y), linewidth = 1, colour = "blue", alpha = 0.5) +
-  geom_linerange(data = data.frame(x = sim_node_values,
-                                   y_max = height_error_bar+0.85, y_min = height_error_bar,
-                                   ID_group = ceiling(seq_len(last(ngroup_idx_to_plot)*n_group)/n_group)),
-                 mapping = aes(x = x, ymin = y_min, ymax = y_max),
-                 linewidth = 1, colour = "black") +
-  scale_y_continuous(name = "Posterior distribution", breaks = 1:10, 
-                     labels = 1:10) +
-  scale_fill_viridis_c(name = "Density", option = "mako") +
-  facet_wrap(facets = ~ ID_group, ncol = 5) +
-  theme_bw()
-
-## Setting the configuration for the INLA-RF Algorithm ----
-
-### Setting the configuration of the inla.stack and the new model formula ----
-
-# selected_spt_nodes: Nodes selected from the spatio-temporal structure
-A_u.iid <- matrix(data = 0, nrow = nrow(DF_strong_sim), ncol = nstress) %>% as(., "TsparseMatrix")
-for(k in (selected_spt_nodes$ID+1)){
-  A_idx_train <- idx_train[which(A_spt_inf[idx_train,k] != 0)]
-  i <- A_idx_train - 1 # 'sparseMatrix-class' uses the python indexx notation 0:(length-1) 
-  j <- rep(which(k == (selected_spt_nodes$ID + 1)) - 1, length(i)) # 'sparseMatrix-class' uses the python indexx notation 0:(length-1)
-  A_u.iid@i <- c(A_u.iid@i, as.integer(i))
-  A_u.iid@j <- c(A_u.iid@j, as.integer(j))
-  A_u.iid@x <- c(A_u.iid@x, A_spt_inf[A_idx_train, k])
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
 }
 
-spt_formula_loop <- y ~ -1 + offset(offx) + beta0 + f(f_x1, model = "iid", constr = TRUE) + 
-  f_x2 + f_x3 +
-  # f(f_x2, model = "rw2", constr = TRUE) + f(f_x3, model = "rw2", constr = TRUE) +
-  f(spt, model = spde_spt, group = spt.group, control.group = list(model = "ar1")) +
-  f(u.iid, model = "iid", hyper = list(prec = list(initial = log(tau.iid), fixed = TRUE)))
+colors_base <- gg_color_hue(2)
 
-inf_stk_loop <- inla.stack(data = list(y = DF_train$y),
-                           A = list(1, A_spt_inf, A_u.iid),
-                           effects = list(
-                             list(beta0 = rep(1, nrow(DF_train)),
-                                  f_x1 = as.numeric(DF_train$X1),
-                                  # f_x2 = x2_group,
-                                  # f_x3 = x3_group,
-                                  f_x2 = DF_strong_sim$X2,
-                                  f_x3 = DF_strong_sim$X3
-                             ),
-                             spde_spt_idx,
-                             list(u.iid = 1:nstress)
-                           ),
-                           remove.unused = FALSE,
-                           compress = FALSE,
-                           tag = "inf_stk")
+nstress <- 1E2
+sel_stressp <- (rinla_orig$summary.random$u$sd**2) %>% order(., decreasing = TRUE) %>% .[1:nstress]
+stress_col <- rep("blue", times = nsize); stress_col[sel_stressp] <- "red"
+ggplot() +
+  geom_ribbon(data = data.frame(ID = 1:nsize, rinla_orig$summary.random$u, id = "Temporal Effect") %>%
+                rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
+  geom_line(data = data.frame(ID = 1:nsize, rinla_orig$summary.random$u, id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "blue") +
+  geom_line(data = data.frame(ID = 1:nsize, mean = u.rw1, id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "black") +
+  geom_point(data = data.frame(ID = 1:nsize, mean = u.rw1), mapping = aes(x = ID, y = mean, colour = stress_col), size = 2) +
+  theme_bw() + labs(title = "Temporal effect nodes") +
+  labs(colour = "Stress points") +
+  scale_color_manual(labels = c("Not stressed", "Stressed"),
+                     values = colors_base) +
+  theme(plot.title = element_text(size = 20, h = 0.5, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14), 
+        legend.title = element_text(size = 18, face = "bold"),
+        legend.text = element_text(size = 16))
 
-### Setting the initial configuration of the algorithm and offsets ----
+# Setting the configuration for the Algorithm ----
 
-ysim <- DF_strong_sim$y
-e <- y.e_hat <- rep(0, nrow(DF_strong_sim)) # Offset of the residual estimations from the RF. Initialized with y.e_hat = 0.
-# offx <- rep(0, times = nrow(DF_strong_sim))
-offx <- rep(0, times = rinla_orig$misc$configs$npred + nstress)
-# off_variance <- 0
+y.e_hat <- rep(0, length(ysim)) # Offset of the residual estimations from the RF. Initialized with y.e_hat = 0.
 KLD_GMRF_den <- 10 # Initial value for the KLD
-i <- 0 # Number of loops = i
+i <- 1 # Number of loops = i-1
 
-DFrmse_train <- data.frame(INLA = NA, INLA.RF = NA)
-DFrmse_test <- data.frame(INLA = NA, INLA.RF = NA)
-KLD_comp <- "fast_full"
+DFrmse <- data.frame(INLA = NA, INLA.RF = NA)
 verbose <- TRUE
 
+rinla <- rinla
+sel <- sel_stressp
+
+A_u.iid <- matrix(data = 0, nrow = nsize, ncol = length(sel)) %>% as(., "sparseMatrix")
+for(k in sel){
+  A_u.iid[k,which(k == sel)] <- 1
+}
+
+inf_stack <- inla.stack(data = list(y = ysim),
+                        A = list(1, A_u.iid),
+                        effects = list(
+                          list(beta0 = rep(1, nsize),
+                               u.rw1 = 1:nsize),
+                          list(u.iid = 1:nstress)
+                        ),
+                        compress = FALSE,
+                        remove.unused = FALSE,
+                        tag = "inf.stk")
+
+
+
+## Defining the measures for predictive performance ----
+
+idx_train <- seq_along(ysim)
+
+DFrmse_train <- data.frame(INLA = NA, INLA.RF = NA, INLA.RFstress = NA)
+# DFrmse_test <- data.frame(INLA = NA, INLA.RF = NA)
+
+DFmae_train <- data.frame(INLA = NA, INLA.RF = NA, INLA.RFstress = NA)
+# DFmae_test <- data.frame(INLA = NA, INLA.RF = NA)
+
+DFcp_train <- data.frame(INLA = NA, INLA.RF = NA, INLA.RFstress = NA)
+# DFcp_test <- data.frame(INLA = NA, INLA.RF = NA)
+
+DFaiw_train <- data.frame(INLA = NA, INLA.RF = NA, INLA.RFstress = NA)
+# DFaiw_test <- data.frame(INLA = NA, INLA.RF = NA)
+
+## Computing the measure for the train/test sets of the standard INLA approach ----
+
+DFrmse_train$INLA <- sqrt(mean((ysim[idx_train] - rinla_orig$summary.fitted.values[idx_train,"mean"])**2))
+# DFrmse_test$INLA <- sqrt(mean((ysim[idx_test] - rinla_orig$summary.fitted.values[idx_test,"mean"])**2))
+
+DFmae_train$INLA <- mean(abs(ysim[idx_train] - rinla_orig$summary.fitted.values[idx_train,"mean"]))
+# DFmae_test$INLA <- mean(abs(ysim[idx_test] - rinla_orig$summary.fitted.values[idx_test,"mean"]))
+
+DFcp_train$INLA <- mean(ysim[idx_train] >= rinla_orig$summary.fitted.values[idx_train,"0.025quant"] & ysim[idx_train] <= rinla_orig$summary.fitted.values[idx_train,"0.975quant"])
+# DFcp_test$INLA <- mean(ysim[idx_test] >= rinla_orig$summary.fitted.values[idx_test,"0.025quant"] & ysim[idx_test] <= rinla_orig$summary.fitted.values[idx_test,"0.975quant"])
+
+DFaiw_train$INLA <- mean(rinla_orig$summary.fitted.values[idx_train,"0.975quant"] - rinla_orig$summary.fitted.values[idx_train,"0.025quant"])
+# DFaiw_test$INLA <- mean(rinla_orig$summary.fitted.values[idx_test,"0.975quant"] - rinla_orig$summary.fitted.values[idx_test,"0.025quant"])
+
+
 t1 <- Sys.time()
-while(KLD_GMRF_den > 1E-2){ # Using the KLD as condition
-  if(i>0){
-    
+while(KLD_GMRF_den>1E-2){ # Using the KLD as condition
+  if(i == 2){
     mu_old <- mu_new
     Q_old <- Q_new
-    
-    if(i == 1){
-      offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] <- offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] + y.e_hat_spt
-      
-      tau.iid <- as.numeric(fit_rf_e$prediction.error)**(-1)
-      # mnpred = sum(dim(inf_stk$A)) = size(y_obs) + size(letent_field), without any reduction.
-      list_control_mode <- list(x = c(rep(0, rinla$misc$configs$mpred + dim(inf_stk_loop$A)[2]), rinla$misc$configs$config[[1]]$improved.mean[1:(length(rinla$misc$configs$config[[1]]$improved.mean)-nrow(rinla$summary.fixed))], rep(0, times = nstress), rev(length(rinla$misc$configs$config[[1]]$improved.mean) - 0:(nrow(rinla$summary.fixed)-1))), 
-                                theta = rinla$mode$theta, restart = TRUE, fixed = FALSE)
-    } else{
-      offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] <- offx[(length(offx) - nrow(rinla$summary.fixed) - nstress) + 1:nstress] + rinla$summary.random$u.iid$mean + y.e_hat_spt
-      tau.iid <- as.numeric(fit_rf_e$prediction.error)**(-1)
-      # mnpred = sum(dim(inf_stk$A)) = size(y_obs) + size(letent_field)
-      list_control_mode <- list(x = c(rep(0, sum(dim(inf_stk_loop$A))), rinla$misc$configs$config[[1]]$improved.mean),
-                                theta = rinla$mode$theta, restart = TRUE, fixed = FALSE)
-    }
-    
-    
-    # offx[idx_train] <- offx[idx_train] + y.e_hat[idx_train]
-    rinla <- inla(data = inla.stack.data(stack = inf_stk_loop), 
-                  family = "gaussian",
-                  formula = spt_formula_loop,
-                  # offset = offx,
-                  control.predictor = list(A = inla.stack.A(inf_stk_loop)),
-                  control.compute = list(config = TRUE),
-                  control.mode = list_control_mode,
-                  num.threads = 48,
-                  verbose = FALSE)
-    
-    size_imprmean <- length(rinla$misc$configs$config[[1]]$improved.mean)
-    size_fixed <- nrow(rinla$summary.fixed)
-    idx_latent_orig <- setdiff(1:size_imprmean, (size_imprmean-nstress-size_fixed+1):(size_imprmean-size_fixed))
-    mu_new <- rinla$misc$configs$config[[1]]$improved.mean[idx_latent_orig]
-    Q_new <- fix.Q(rinla$misc$configs$config[[1]]$Q[idx_latent_orig, idx_latent_orig])
-    Q_inv_new <- inla.qinv(Q_new) %>% as(., Class = "CsparseMatrix") # The original Compress Sparse format is COO. Therefore, we need to convert it to CSC, aka "CsparseMatrix", for faster computational performance.
-    
-    if(KLD_comp == "fast_full"){# Computing the KLD using the whole Q precision matrix (using the whole information from both GMRFs)
-      # t1 <- Sys.time()
-      idx_reord <- inla.qreordering(graph = Q_new)
-      L_ir <- chol(Q_new[idx_reord$ireordering,idx_reord$ireordering])
-      L_ir_old <- chol(Q_old[idx_reord$ireordering,idx_reord$ireordering])
-      KLD_GMRF_den <- 1/2*(sum(diagonal_producto_csc(A = Q_inv_new, B = Q_old)) - nrow(Q_new) + drop((mu_new-mu_old) %*% Q_new %*% cbind(mu_new-mu_old)) + 2*sum(log(diag(L_ir))) - 2*sum(log(diag(L_ir_old))))/nrow(Q_new)
-      # t2 <- Sys.time()
-    } else if(KLD_comp == "diag"){
-      # t1 <- Sys.time()
-      idx_reord <- inla.qreordering(graph = Q_new)
-      L_ir <- chol(Q_new[idx_reord$ireordering,idx_reord$ireordering])
-      L_ir_old <- chol(Q_old[idx_reord$ireordering,idx_reord$ireordering])
-      KLD_GMRF_den <- 1/2*(sum(diag(Q_inv_new) * diag(Q_old)) - nrow(Q_new) + drop(t(mu_new-mu_old) %*% Diagonal(x=diag(Q_new)) %*% cbind(mu_new-mu_old)) + 2*sum(log(diag(L_ir))) - 2*sum(log(diag(L_ir_old))))/nrow(Q_new)
-      # t2 <- Sys.time()
-    } else{ # Slow, pretty slow, ... (we don't need to compute the KLD this way, as the fast_full is the computational right manner of compute the KLD for huge GMRF)
-      KLD_GMRF_den <- 1/2*(sum(diag(solve(Q_new)%*%Q_old)) - nrow(Q_new) + drop((mu_new-mu_old) %*% Q_new %*% cbind(mu_new-mu_old)) + determinant(Q_new, logarithm = TRUE)$modulus - determinant(Q_old, logarithm = TRUE)$modulus)/nrow(Q_new)
-    }
+    tau.iid <- as.numeric(optim_mu_sd[2])**(-2)
+    list_control_mode <- list(theta = rinla$mode$theta, restart = TRUE, fixed = FALSE)
+  } else if(i > 2){
+    mu_old <- mu_new
+    Q_old <- Q_new
+    tau.iid <- as.numeric(optim_mu_sd[2])**(-2)
+    list_control_mode <- list(x = c(rep(0, rinla$misc$configs$mnpred), rinla$misc$configs$config[[1]]$improved.mean), 
+                              theta = rinla$mode$theta, restart = TRUE, fixed = FALSE)
+  } else{
+    tau.iid <- 0.001
+    list_control_mode <- inla.set.control.mode.default()
   }
   
-  e[idx_train] <- ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"]
-  sp_coord <- st_coordinates(DF_strong_sim$geometry)
-  df_e <- data.frame(e = e, id_time = DF_strong_sim$id_time, X1 = DF_strong_sim$X1, X2 = DF_strong_sim$X2, X3 = DF_strong_sim$X3, sp_x = sp_coord[,1], sp_y = sp_coord[,2])
+  if(!("rinla" %in% ls()) | i != 1){
+    if(length(rinla$misc$configs$offsets) != (dim(inf_stack$A)[2] + length(ysim))){
+      offx <- rep(0, times = dim(inf_stack$A)[2])
+      offx[(length(offx) - nrow(rinla$summary.fixed) - length(sel) + 1) + 1:length(sel)] <- y.e_hat[sel]
+    } else{
+      # print("Hello! I am here!")
+      offx[(length(offx) - nrow(rinla$summary.fixed) - length(sel) + 1) + 1:length(sel)] <- offx[(length(offx) - nrow(rinla$summary.fixed) - length(sel) + 1) + 1:length(sel)] + rinla$summary.random$u.iid$mean + y.e_hat[sel]
+    }
+    
+    rinla <- inla(data = inla.stack.data(inf_stack), 
+                  family = "gaussian",
+                  formula = y ~ -1 + offset(offx) + beta0 + f(u.rw1, model = "rw2", constr = TRUE) + f(u.iid, model = "iid", hyper = list(prec = list(initial = log(tau.iid), fixed = TRUE))),
+                  control.compute = list(config = TRUE),
+                  control.predictor = list(A = inla.stack.A(inf_stack)),
+                  control.mode = list_control_mode,
+                  verbose = FALSE)
+    
+    idx.uiid <- rinla$misc$configs$contents$length[3:(which(rinla$misc$configs$contents$tag == "u.iid")-1)] + (1:rinla$misc$configs$contents$length[which(rinla$misc$configs$contents$tag == "u.iid")])
+    mu_new <- rinla$misc$configs$config[[1]]$improved.mean[-c(idx.uiid)]
+    Q_new <- rinla$misc$configs$config[[1]]$Q[-c(idx.uiid), -c(idx.uiid)]
+    Q_inv_new <- rinla$misc$configs$config[[1]]$Qinv[-c(idx.uiid), -c(idx.uiid)]
+    if(i == 1){
+      mu_old <- rep(0, times = length(mu_new))
+      Q_old <- rinla$misc$configs$config[[1]]$Qprior[-c(idx.uiid), -c(idx.uiid)]
+    }
+  } else{
+    mu_new <- rinla$misc$configs$config[[1]]$improved.mean
+    Q_new <- rinla$misc$configs$config[[1]]$Q
+    Q_inv_new <- rinla$misc$configs$config[[1]]$Qinv
+    
+    mu_old <- rep(0, times = length(mu_new))
+    Q_old <- rinla$misc$configs$config[[1]]$Qprior
+  }
+  
+  KLD_GMRF_den <- 1/2*(sum(diag(solve(Q_new)%*%Q_old)) - nrow(Q_new) + drop((mu_new-mu_old) %*% Q_new %*% cbind(mu_new-mu_old)) + determinant(Q_new, logarithm = TRUE)$modulus - determinant(Q_old, logarithm = TRUE)$modulus)/nrow(Q_new)
+  
+  e <- ysim - rinla$summary.fitted.values[1:length(ysim),"mean"]
+  df_e <- data.frame(e = e, rw1 = 1:nsize)
   
   fit_rf_e <- 
-    ranger(formula = e ~ id_time + sp_x + sp_y, # id_time + sp_x + sp_y,
-           data = df_e[idx_train,],
+    ranger(formula = e ~ rw1,
+           data = df_e,
            importance = "none",
            replace = FALSE,
            seed = seed,
            oob.error = TRUE)
   
-  y.e_hat_spt <- predict(fit_rf_e, data = data.frame(sp_x = mesh_inf$loc[selected_mesh_nodes,1], sp_y = mesh_inf$loc[selected_mesh_nodes,2], id_time = group_mesh))$predictions
+  oob_error <- df_e$e - fit_rf_e$predictions #oob predictions
   
-  # idx_nnodes.obs <- mclapply(X = seq_len(nrow(A_u.iid)), mc.cores = 10, FUN = function(i){sum(A_u.iid[i,] != 0)}) %>% do.call(what = c, .)
-  # y.e_hat[idx_train] <- fit_rf_e$predictions
-  # ei_hat.u <- y.e_hat[A_u.iid@i+1]*A_u.iid@x/idx_nnodes.obs[A_u.iid@i+1]
-  # ei_hat.u <- y.e_hat[A_u.iid@i+1]/idx_nnodes.obs[A_u.iid@i+1]
+  dens_oob_error <- density(oob_error)
+  dens_oob_error$x <- dens_oob_error$x[dens_oob_error$y!=0]
+  dens_oob_error$y <- dens_oob_error$y[dens_oob_error$y!=0]
   
-  # y.e_hat_spt <- mclapply(X = seq_len(nstress), mc.cores = 10, FUN = function(i){mean(ei_hat.u[(A_u.iid@j+1)==i])}) %>% do.call(what = c, .)
+  # Optimazing the mean and the standard deviation of the optimal Gaussian
+  # optim_mu_sd <- optim(par = c(mean(oob_error), sd(oob_error)), method = "BFGS", fn = function(x){pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x, mean = x[1], sd = x[2])))))})
+  # KLD_emp_the <-  pracma::trapz(x = dens_oob_error$x, y = abs(dens_oob_error$y * (log(dens_oob_error$y) - log(dnorm(x = dens_oob_error$x,mean = optim_mu_sd$par[1], sd = optim_mu_sd$par[2])))))
+  optim_mu_sd <- c(mean(oob_error), sd(oob_error)) # alternative to avoid the optimization step (just assume that the empirical mean and variance are used
   
-  i = i + 1 # Increasing in 1 the value of the index for the loop
-  # DFrmse_train[i,] <- c(sqrt(mean((ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"])**2)), sqrt(mean((ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"] - y.e_hat[idx_train])**2)))
-
-  if(verbose && i > 1){
+  if("sel" %in% ls()){
+    y.e_hat[sel] <- fit_rf_e$predictions[sel]
+  } else{
+    y.e_hat <- fit_rf_e$predictions
+  }
+  
+  DFrmse[i,] <- c(sqrt(mean((ysim - rinla$summary.fitted.values[1:length(ysim),"mean"])**2)), sqrt(mean((ysim - rinla$summary.fitted.values[1:length(ysim),"mean"] - y.e_hat)**2)))
+  
+  i = i + 1
+  if(verbose){
     sprintf("KLD: %.4f. \n", KLD_GMRF_den) %>% cat(.)
     sprintf("Iteration: %i. \n", i-1) %>% cat(.)
     cat("---------------------------------------------- \n")
@@ -316,26 +282,156 @@ while(KLD_GMRF_den > 1E-2){ # Using the KLD as condition
 t2 <- Sys.time()
 difftime(t2, t1)
 
-# Graphical results for the node correction ----
+# RMSE for the different steps: INLA means the inla output after incorporating the RF corrections (for i > 1), and INLA.RF means the rmse for the RF output
+DFrmse
 
-marginals_spt_rf <- mclapply(X = selected_spt_nodes$ID+1, mc.cores = 1, FUN = function(i){
-  inla.tmarginal(marginal = rinla$marginals.random$spt[[i]], fun = function(x){((x - rinla$summary.random$spt$mean[i])/rinla$summary.random$spt$sd[i])*sqrt(rinla$summary.random$spt$sd[i]**2 + rinla$summary.random$spt$mean[i] + rinla$summary.random$u.iid$sd[which((selected_spt_nodes$ID+1)==i)]**2) + rinla$summary.random$u.iid$mean[which((selected_spt_nodes$ID+1)==i)]})
-})
+## Computing the measure for the train/test sets of the SPDE-RF (with no uncertainty transferring) approach ----
 
-n_group <- 10
-nodes_sel_marg_rf <- mclapply(X = 1:nstress, mc.cores = 1, FUN = function(i){cbind(data.frame(marginals_spt_rf[[i]]), group = i%%n_group + if(i%%n_group==0){n_group}else{0}, height = 0, ID_group = ceiling(i/n_group))}) %>% 
-  do.call(what = rbind, .)
+DFrmse_train$INLA.RF <- sqrt(mean((ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"])**2))
+DFrmse_train$INLA.RFstress <- sqrt(mean((ysim[sel] - rinla$summary.fitted.values[sel,"mean"])**2))
+DFrmse_train$INLAstress <- sqrt(mean((ysim[sel] - rinla_orig$summary.fitted.values[sel,"mean"])**2))
+# DFrmse_test$INLA.RF <- sqrt(mean((ysim[idx_test] - rinla$summary.fitted.values[idx_test,"mean"])**2))
 
-ggplot() +
-  geom_ridgeline_gradient(data = nodes_sel_marg[nodes_sel_marg$ID_group %in% ngroup_idx_to_plot,], mapping = aes(x = x, y = height + group, group = group, height = y, scale = scale_ridge, fill = y), linewidth = 1, colour = "blue", alpha = 0.5) +
-  geom_ridgeline_gradient(data = nodes_sel_marg_rf[nodes_sel_marg$ID_group %in% ngroup_idx_to_plot,], mapping = aes(x = x, y = height + group, group = group, height = y, scale = scale_ridge, fill = y), linewidth = 1, colour = "red", alpha = 0.5) +
-  geom_linerange(data = data.frame(x = sim_node_values,
-                                   y_max = height_error_bar+0.85, y_min = height_error_bar,
-                                   ID_group = ceiling(seq_len(last(ngroup_idx_to_plot)*n_group)/n_group)),
-                 mapping = aes(x = x, ymin = y_min, ymax = y_max),
-                 linewidth = 1, colour = "black") +
-  scale_y_continuous(name = "Posterior distribution", breaks = 1:10, 
-                     labels = 1:10) +
-  scale_fill_viridis_c(name = "Density", option = "mako") +
-  facet_wrap(facets = ~ ID_group, ncol = 5) +
-  theme_bw()
+DFmae_train$INLA.RF <- mean(abs(ysim[idx_train] - rinla$summary.fitted.values[idx_train,"mean"]))
+DFmae_train$INLA.RFstress <- mean(abs(ysim[sel] - rinla$summary.fitted.values[sel,"mean"]))
+DFmae_train$INLAstress <- mean(abs(ysim[sel] - rinla_orig$summary.fitted.values[sel,"mean"]))
+# DFmae_test$INLA.RF <- mean(abs(ysim[idx_test] - rinla$summary.fitted.values[idx_test,"mean"]))
+
+DFcp_train$INLA.RF <- mean(ysim[idx_train] >= (rinla$summary.fitted.values[idx_train,"0.025quant"]) & ysim[idx_train] <= (rinla$summary.fitted.values[idx_train,"0.975quant"]))
+DFcp_train$INLA.RFstress <- mean(ysim[sel] >= (rinla$summary.fitted.values[sel,"0.025quant"]) & ysim[sel] <= (rinla$summary.fitted.values[sel,"0.975quant"]))
+DFcp_train$INLAstress <- mean(ysim[sel] >= (rinla_orig$summary.fitted.values[sel,"0.025quant"]) & ysim[sel] <= (rinla_orig$summary.fitted.values[sel,"0.975quant"]))
+# DFcp_test$INLA.RF <- mean(ysim[idx_test] >= (rinla$summary.fitted.values[idx_test,"0.025quant"]) & ysim[idx_test] <= (rinla$summary.fitted.values[idx_test,"0.975quant"]))
+
+DFaiw_train$INLA.RF <- mean(rinla$summary.fitted.values[idx_train,"0.975quant"] - rinla$summary.fitted.values[idx_train,"0.025quant"]) # Neutralized the effect of the offset for the interval calculation
+DFaiw_train$INLA.RFstress <- mean(rinla$summary.fitted.values[sel,"0.975quant"] - rinla$summary.fitted.values[sel,"0.025quant"]) # Neutralized the effect of the offset for the interval calculation
+DFaiw_train$INLAstress <- mean(rinla_orig$summary.fitted.values[sel,"0.975quant"] - rinla_orig$summary.fitted.values[sel,"0.025quant"]) # Neutralized the effect of the offset for the interval calculation
+
+idx_ord <- order(ysim - rinla_orig$summary.fitted.values[1:length(ysim),"mean"])
+
+gg_AIW_CP_INLA <- ggplot() + # ILA without RF corrections 
+  geom_ribbon(data = data.frame(ID = 1:nsize, rinla_orig$summary.fitted.values[(1:length(ysim))[idx_ord],], id = "Temporal Effect") %>%
+                rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
+              mapping = aes(x = ID, ymin = q1 - ysim[idx_ord], ymax = q3 - ysim[idx_ord]), fill = "blue", alpha = 0.4) +
+  geom_ribbon(data = data.frame(ID = 1:nsize, rinla$summary.fitted.values[(1:length(ysim))[idx_ord],], id = "Temporal Effect") %>%
+                rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
+              mapping = aes(x = ID, ymin = q1 - ysim[idx_ord], ymax = q3 - ysim[idx_ord]), fill = "red", alpha = 0.4) +
+  geom_line(data = data.frame(ID = 1:nsize, mean = rep(0, times = length(ysim)), id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "black") +
+  # geom_point(data = data.frame(x = sel_stressp, y = ysim[sel_stressp]), mapping = aes(x = x, y = y), color = "red", alpha = 0.25) +
+  labs(title = "Credible intervals") + ylab(label = "") + xlab(label = "") +
+  theme_bw() + theme(plot.title = element_text(face = "bold", h = 0.5, size = 24))
+
+# DFaiw_test$INLA.RF <- mean(rinla$summary.fitted.values[idx_test,"0.975quant"] - rinla$summary.fitted.values[idx_test,"0.025quant"]) # Neutralized the effect of the offset for the interval calculation
+
+## Computing RMSE for the stress points
+
+sqrt(mean((ysim[sel_stressp] - rinla_orig$summary.fitted.values[1:length(ysim),"mean"][sel_stressp])**2)) # RMSE for the stress points using the first INLA without RF corrections
+sqrt(mean((ysim[sel_stressp] - rinla$summary.fitted.values[1:length(ysim),"mean"][sel_stressp])**2)) # RMSE for the stress points after the RF corrections
+
+gg_lpred_INLA <- ggplot() + # ILA without RF corrections 
+  geom_ribbon(data = data.frame(ID = 1:nsize, rinla_orig$summary.fitted.values[1:length(ysim),], id = "Temporal Effect") %>%
+                rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
+  geom_line(data = data.frame(ID = 1:nsize, rinla_orig$summary.fitted.values[1:length(ysim),], id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "blue") +
+  geom_line(data = data.frame(ID = 1:nsize, mean = ysim, id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "black") +
+  geom_point(data = data.frame(x = sel_stressp, y = ysim[sel_stressp]), mapping = aes(x = x, y = y), color = "red", alpha = 0.25) +
+  labs(title = "Linear predictor (INLA)") +
+  theme_bw() + theme(plot.title = element_text(face = "bold", h = 0.5))
+
+
+gg_lpred_INLA.RF <- ggplot() + # INLA without RF corrections 
+  geom_ribbon(data = data.frame(ID = 1:nsize, rinla$summary.fitted.values[1:length(ysim),], id = "Temporal Effect") %>%
+                rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
+  geom_line(data = data.frame(ID = 1:nsize, rinla$summary.fitted.values[1:length(ysim),], id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "blue") +
+  geom_line(data = data.frame(ID = 1:nsize, mean = ysim, id = "Temporal Effect"),
+            mapping = aes(x = ID, y = mean), color = "black") +
+  geom_point(data = data.frame(x = sel_stressp, y = ysim[sel_stressp]), mapping = aes(x = x, y = y), color = "red", alpha = 0.25) +
+  labs(title = "Linear predictor (INLA-RF)") +
+  theme_bw() + theme(plot.title = element_text(face = "bold", h = 0.5))
+
+grid.arrange(arrangeGrob(grobs = list(gg_lpred_INLA, gg_lpred_INLA.RF), ncol = 1))
+
+gg_origcor_INLA <- ggplot() +
+  geom_point(data = rinla_orig$summary.fitted.values[1:length(ysim),][sel_stressp[order(sel_stressp)],], mapping = aes(x = 1:length(sel_stressp)-0.25, y = mean)) +
+  geom_errorbar(data = rinla_orig$summary.fitted.values[1:length(ysim),][sel_stressp[order(sel_stressp)],], aes(x = 1:length(sel_stressp)-0.25, ymin=mean-sd, ymax=mean+sd), width=.2, position = position_dodge(0.05)) +
+  geom_point(data = rinla$summary.fitted.values[1:length(ysim),][sel_stressp[order(sel_stressp)],], mapping = aes(x = 1:length(sel_stressp) + 0.25, y = mean), colour = "red") +
+  geom_errorbar(data = rinla$summary.fitted.values[1:length(ysim),][sel_stressp[order(sel_stressp)],], aes(x = 1:length(sel_stressp) + 0.25, ymin=mean-sd, ymax=mean+sd), width=.2, position = position_dodge(0.05), colour = "red") +
+  geom_segment(data.frame(xi = 1:length(sel_stressp)-0.5, xe = 1:length(sel_stressp)+0.5, y = ysim[sel_stressp[order(sel_stressp)]]), mapping = aes(x = xi, xend = xe, y = y), lty = "solid", colour = "blue", alpha = 0.75) +
+  labs(title = "Stress points (original vs corrected by RF)") +
+  theme_bw() + theme(plot.title = element_text(face = "bold", h = 0.5))
+
+# In black the original estimations from INLA, 
+# in red the estimations from INLA corrected by the RF, 
+# and in blue the true value for each stress point that is plotted
+gg_origcor_INLA
+
+grid.arrange(arrangeGrob(grobs = list(gg_lpred_INLA, gg_lpred_INLA.RF, gg_origcor_INLA), layout_matrix = matrix(data = c(1,2,3,3), ncol = 2)))
+
+rinla_u.rw1_sel <- rinla$summary.random$u.rw1[sel_stressp[order(sel_stressp)],]
+rinla_u.rf_sel <- rinla$summary.random$u.iid[order(sel_stressp),]
+
+rinla_u.rw1_sel$mean <- rinla_u.rw1_sel$mean + rinla_u.rf_sel$mean + + offx[(length(offx) - nrow(rinla$summary.fixed) - length(sel) + 1) + 1:length(sel)][order(sel_stressp)]
+rinla_u.rw1_sel$sd <- sqrt(rinla_u.rw1_sel$sd**2 + rinla_u.rf_sel$sd**2)
+
+rw1_corr <- rinla$summary.random$u.rw1
+rw1_corr$mean[sel_stressp[order(sel_stressp)]] <- rinla_u.rw1_sel$mean
+rw1_corr$sd[sel_stressp[order(sel_stressp)]] <- rinla_u.rw1_sel$sd
+rw1_corr[,"0.025quant"] <- qnorm(p = 0.025, mean = rw1_corr$mean, sd = rw1_corr$sd)
+rw1_corr[,"0.975quant"] <- qnorm(p = 0.975, mean = rw1_corr$mean, sd = rw1_corr$sd)
+
+gg_rw_INLA <- ggplot(rw1_corr, mapping = aes(ID, mean)) +
+  geom_ribbon(data = rinla_orig$summary.random$u %>% data.frame(., id = "Original") %>%
+                rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
+  geom_line(data = data.frame(rinla_orig$summary.random$u, id = "Original"),
+            mapping = aes(x = ID, y = mean), color = "blue") +
+  geom_line(data = data.frame(ID = 1:nsize, mean = u.rw1, id = "Original"),
+            mapping = aes(x = ID, y = mean), color = "black") +
+  geom_ribbon(data = rw1_corr %>% data.frame(., id = "Corrected") %>%
+                rename(., all_of(c(q1 = 'X0.025quant', q3 = 'X0.975quant'))),
+              mapping = aes(x = ID, ymin = q1, ymax = q3), fill = "blue", alpha = 0.4) +
+  geom_line(data = data.frame(rw1_corr, id = "Corrected"),
+            mapping = aes(x = ID, y = mean), color = "blue") +
+  geom_line(data = data.frame(ID = 1:nsize, mean = u.rw1, id = "Corrected"),
+            mapping = aes(x = ID, y = mean), color = "black") +
+  geom_vline(xintercept = sel_stressp[order(sel_stressp)], colour = "salmon", alpha = 0.1) +
+  facet_wrap(facets = ~ id, ncol = 1) +
+  labs(title = "Latent field (original and corrected by RF)") +
+  theme_bw() + # theme(plot.title = element_text(face = "bold", h = 0.5)) +
+  theme(plot.title = element_text(size = 20, h = 0.5, face = "bold"),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14), 
+        legend.title = element_text(size = 18, face = "bold"),
+        legend.text = element_text(size = 16))
+
+gg_rw_INLA_mag <- gg_rw_INLA + 
+  geom_magnify(aes(from = ID > 352 & ID < 373), to = c(150, 310, -1, 9)) +
+  geom_magnify(aes(from = ID > 534 & ID < 554), to = c(390, 540, 2, 13)) +
+  geom_magnify(aes(from = ID > 895 & ID < 920), to = c(730, 870, -2, 9)) +
+  geom_magnify(aes(from = ID > 1073 & ID < 1094), to = c(940, 1070, 5, 16)) +
+  geom_magnify(aes(from = ID > 1436 & ID < 1456), to = c(1300, 1410, 5, 16)) +
+  geom_magnify(aes(from = ID > 1620 & ID < 1637), to = c(1650, 1800, -2, 9))
+
+gg_rw_origcor_INLA <- ggplot() +
+  geom_point(data = rinla_orig$summary.random$u[1:length(ysim),][sel_stressp[order(sel_stressp)],], mapping = aes(x = 1:length(sel_stressp)-0.25, y = mean)) +
+  geom_errorbar(data = rinla_orig$summary.random$u[1:length(ysim),][sel_stressp[order(sel_stressp)],], aes(x = 1:length(sel_stressp)-0.25, ymin=mean-sd, ymax=mean+sd), width=.2, position = position_dodge(0.05)) +
+  geom_point(data = rinla_u.rw1_sel, mapping = aes(x = 1:length(sel_stressp) + 0.25, y = mean), colour = "red") +
+  geom_errorbar(data = rinla_u.rw1_sel, aes(x = 1:length(sel_stressp) + 0.25, ymin=mean-sd, ymax=mean+sd), width=.2, position = position_dodge(0.05), colour = "red") +
+  geom_segment(data.frame(xi = 1:length(sel_stressp)-0.5, xe = 1:length(sel_stressp)+0.5, y = u.rw1[sel_stressp[order(sel_stressp)]]), mapping = aes(x = xi, xend = xe, y = y), lty = "solid", linewidth = 1, colour = "blue", alpha = 0.75) +
+  labs(title = "Latent field stress points (original vs corrected by RF)") + xlab(label = "ID") +
+  theme_bw() + # theme(plot.title = element_text(face = "bold", h = 0.5))
+  theme(plot.title = element_text(size = 20, h = 0.5, face = "bold"),
+        axis.title.x = element_blank(), # element_text(size = 18), 
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 18), 
+        axis.text = element_text(size = 14), 
+        legend.title = element_text(size = 18, face = "bold"),
+        legend.text = element_text(size = 16))
+
+grid.arrange(arrangeGrob(grobs = list(gg_rw_INLA, gg_rw_origcor_INLA), ncol = 2))
+
